@@ -29,3 +29,7 @@ src-tauri/tauri/*
 admAgent
 .catpaw
 .mimocode
+
+# 代码签名证书（仅本地，不提交）
+*.pfx
+.adm-code-signing.pfx

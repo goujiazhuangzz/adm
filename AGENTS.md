@@ -49,8 +49,10 @@
 
 ## 构建与发布
 - CI：`.github/workflows/build.yml` — 标签触发（`v*`），构建 Windows + macOS，自签名。
-- 发布：`pnpm tauri:build:<平台>` 然后 `pnpm sign:<平台>`。
-- 图标：`python scripts/generate-icons.py` 从 `src-tauri/icons/source.png` 生成。
+- **Windows 签名**：`tauri.conf.json` 中 `bundle.windows.signCommand` 指向 `scripts/sign-windows-file.ps1`，构建时自动签名主程序 EXE 和 NSIS 安装包。签名使用自签名证书（`CN=ADM Self-Signed Cert`），首次构建自动创建并导出 PFX 到 `~/.adm-code-signing.pfx`，后续复用。
+- **手动补签**：`pnpm sign:windows` 运行 `scripts/sign-windows.ps1`，查找所有构建产物并签名（验证用）。
+- 发布：`pnpm release:windows`（= `pnpm tauri:build:windows && pnpm sign:windows`）。
+- 图标：`python scripts/generate-icons.py` 从 `src-tauri/icons/source.png` 生成全套图标（ICO 含 16/24/32/48/64/256 六层，32px 在前；PNG 含 32/64/128/256/512；ICNS 含 128/256/512）。修改 `source.png` 后需重新运行此脚本再打包。
 
 ## 注意事项
 - admAgent api文档在 `doc/server-api.md`

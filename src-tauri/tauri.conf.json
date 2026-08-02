@@ -36,6 +36,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "windows": {
+      "signCommand": {
+        "cmd": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        "args": ["-ExecutionPolicy", "Bypass", "-File", "../scripts/sign-windows-file.ps1", "%1"]
+      }
+    },
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.15",
