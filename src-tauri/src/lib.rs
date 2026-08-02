@@ -68,7 +68,7 @@ fn cleanup_processes(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // 单实例：第二个实例启动时，让第一个实例显示窗口
             show_main_window(app);
@@ -79,6 +79,10 @@ pub fn run() {
         .manage(AppState::new())
         .manage(ilink::IlinkManaged::default())
         .setup(|app| {
+            // 调试日志：按持久化设置恢复开关（开启时截断重建 → 每次重启清空上次日志），
+            // 早于任何 admAgent 交互，确保本次会话从头开始记录。
+            agent::init_debug_logging(app.handle());
+
             // ===== 系统托盘 =====
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出 ADM", true, None::<&str>)?;
@@ -130,6 +134,10 @@ pub fn run() {
 
             // iLink 微信 Bot：已绑定且启用时自动恢复桥接（内部等待 admAgent 就绪）
             ilink::auto_start(app.handle().clone());
+
+            // macOS：清理旧版「运行时下载」模式遗留在 app_data_dir 的 admAgent（新版用安装包内置 sidecar）
+            #[cfg(target_os = "macos")]
+            agent::cleanup_legacy_adm_agent(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -185,9 +193,6 @@ pub fn run() {
             agent::prepare_adm_agent_config,
             agent::check_adm_agent,
             agent::get_adm_agent_version,
-            agent::download_adm_agent,
-            agent::check_adm_agent_update,
-            agent::download_adm_agent_update,
             agent::get_agent_workdir,
             agent::set_agent_workdir,
             agent::pick_workdir_folder,
@@ -203,6 +208,13 @@ pub fn run() {
             agent::agent_unsubscribe_events,
             agent::get_adm_agent_logs,
             agent::export_agent_logs,
+            agent::set_debug_logging,
+            agent::open_debug_log_dir,
+            agent::read_attachment_file,
+            agent::is_directory,
+            agent::save_attachment_file,
+            agent::read_clipboard_files,
+            agent::read_project_memory,
             // ilink.rs - 微信 Bot 桥接
             ilink::start_ilink_login,
             ilink::cancel_ilink_login,
@@ -216,6 +228,15 @@ pub fn run() {
             // lib.rs (index.rs)
             index::minimize_to_tray,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // macOS：Cmd+Q / Dock 菜单退出走 RunEvent::ExitRequested（不是 CloseRequested），
+    // 只有在这里才能统一拦截清理子进程，否则 llama-server / admAgent 残留为孤儿
+    // （端口被占用、下次启动模型报"端口占用"）。cleanup_processes 幂等，重复调用安全。
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            cleanup_processes(app_handle);
+        }
+    });
 }

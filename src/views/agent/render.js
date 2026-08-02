@@ -15,10 +15,33 @@ import { updateScrollBottomBtn } from "./ui.js";
 // （保住 <details> 元素身份，流式期间可点开/收起）；结构变化才重建该消息节点。
 
 // 该 part 是否需要渲染（用户消息不显示 finish 标记）
-function isPartRenderable(part, role) {
+// hiddenCallIds: 因工具不可用（如 Plan 模式下 edit/write）而应隐藏的 tool_call id 集合，
+// 对应的 tool_call 与 tool_result 一并不渲染。
+function isPartRenderable(part, role, hiddenCallIds) {
   if (!part || !part.type) return false;
   if (part.type === "finish" && role === "user") return false;
+  if (hiddenCallIds && hiddenCallIds.size) {
+    var d = part.data || {};
+    if (part.type === "tool_call" && d.id && hiddenCallIds.has(d.id)) return false;
+    if (part.type === "tool_result" && d.tool_call_id && hiddenCallIds.has(d.tool_call_id)) return false;
+  }
   return true;
+}
+
+// 收集"工具不可用"的 tool_call id：Plan 模式下模型仍会尝试 edit/write 等被移除的工具，
+// 服务端必须回 "Tool not found: xxx" 让模型自我纠正，但这类失败对用户无意义，不展示。
+// 返回需隐藏的 tool_call id 集合（tool_call 与其 tool_result 成对隐藏）。
+function unavailableToolCallIds(parts) {
+  var ids = new Set();
+  if (!Array.isArray(parts)) return ids;
+  parts.forEach(function(p) {
+    if (!p || p.type !== "tool_result") return;
+    var d = p.data || {};
+    if (d.is_error && d.tool_call_id && /^Tool not found:/.test(String(d.content || ""))) {
+      ids.add(d.tool_call_id);
+    }
+  });
+  return ids;
 }
 
 // 单个 part 的内容签名（长度/状态足以覆盖流式追加场景）
@@ -42,8 +65,9 @@ function msgSignature(msg) {
 // 消息结构签名：part 类型序列 + 是否有元信息，结构一致才允许就地更新
 function msgStructSig(msg, role) {
   if (msg._streaming || !msg.parts || !Array.isArray(msg.parts) || msg.parts.length === 0) return "plain";
+  var hiddenCallIds = unavailableToolCallIds(msg.parts);
   var types = [];
-  msg.parts.forEach(function(p) { if (isPartRenderable(p, role)) types.push(p.type); });
+  msg.parts.forEach(function(p) { if (isPartRenderable(p, role, hiddenCallIds)) types.push(p.type); });
   return types.join(",") + ((msg.model || msg.provider) ? "|meta" : "");
 }
 
@@ -53,7 +77,15 @@ export function renderMessages() {
   var prevScrollTop = area.scrollTop;
 
   if (S.messages.length === 0) {
-    area.innerHTML = '<div class="empty-state"><span class="empty-state-icon">🤖</span><span class="empty-state-text">开始一个新的对话</span></div>';
+    // 思考先于首条消息产生（如刚发送、重新挂载对账时）：空态下仍需保留「正在思考」指示器，
+    // 否则运行中的指示器被抹掉（切走首页再切回时表现为图标消失）。
+    // syncWorkingIndicator 会按 isSending 负责创建/移动/移除，这里只需避免重复重建空态外壳。
+    if (!area.querySelector(".empty-state")) {
+      var indicator = document.getElementById("agent-working-indicator");
+      area.innerHTML = '<div class="empty-state"><span class="empty-state-icon">🤖</span><span class="empty-state-text">开始一个新的对话</span></div>';
+      if (indicator) area.appendChild(indicator); // innerHTML 会清掉旧指示器，运行中需保留
+    }
+    syncWorkingIndicator(area);
     updateScrollBottomBtn();
     return;
   }
@@ -65,8 +97,8 @@ export function renderMessages() {
   var existing = {};
   Array.prototype.slice.call(area.children).forEach(function(c) {
     if (c.id === "agent-working-indicator") return;
-    // 错误提示节点保留（否则 run_complete 后的 refreshMessages 会把刚显示的中断原因立即清掉）
-    if (c.classList && c.classList.contains("error")) return;
+    // 错误/警告/信息提示节点保留（否则 run_complete 后的 refreshMessages 会把刚显示的提示立即清掉）
+    if (c.classList && (c.classList.contains("error") || c.classList.contains("warn") || c.classList.contains("info"))) return;
     var mid = c.getAttribute ? c.getAttribute("data-msgid") : null;
     if (mid && keySet[mid] && !existing[mid]) existing[mid] = c;
     else c.remove();
@@ -101,22 +133,7 @@ export function renderMessages() {
   });
 
   // 「正在思考」指示器：持久节点，仅按需创建/移动/移除，避免每次重建导致动画闪烁
-  var indicator = document.getElementById("agent-working-indicator");
-  if (S.isSending) {
-    if (!indicator) {
-      indicator = document.createElement("div");
-      indicator.className = "msg assistant working-indicator";
-      indicator.id = "agent-working-indicator";
-      indicator.innerHTML =
-        '<span class="working-indicator-dot"></span>' +
-        '<span class="working-indicator-text">正在思考' +
-          '<span class="working-indicator-dots"><span></span><span></span><span></span>' +
-        '</span></span>';
-    }
-    if (area.lastElementChild !== indicator) area.appendChild(indicator);
-  } else if (indicator) {
-    indicator.remove();
-  }
+  syncWorkingIndicator(area);
 
   // 手动模式：保留用户当前滚动位置；自动模式：滚到底部
   if (S.manualScrollMode) {
@@ -126,6 +143,42 @@ export function renderMessages() {
   }
   // 流式输出时内容增长不一定触发 scroll 事件，渲染后主动刷新悬浮圆球显隐
   updateScrollBottomBtn();
+}
+
+// 「正在思考」指示器同步：运行中确保持久节点存在并置于消息区末尾；结束则移除。
+// 独立成函数，供 renderMessages（含空消息分支）与重新挂载对账复用，
+// 避免依赖消息列表是否为空而漏建（切到首页再切回时图标消失的根因）。
+export function syncWorkingIndicator(area) {
+  area = area || document.getElementById("agent-msg-area");
+  if (!area) return;
+  var indicator = document.getElementById("agent-working-indicator");
+  if (S.isSending) {
+    if (!indicator) {
+      indicator = document.createElement("div");
+      indicator.className = "msg assistant working-indicator";
+      indicator.id = "agent-working-indicator";
+      indicator.innerHTML =
+        '<span class="working-indicator-dot"></span>' +
+        '<span class="working-indicator-text">正在工作' +
+          '<span class="working-indicator-dots"><span></span><span></span><span></span>' +
+        '</span></span>';
+    }
+    // 排队中（本会话消息已入队、尚未开始执行）时文案改为「排队中」，避免误读为正在产出
+    if (S.queuedRun && S.queuedRun.sessionId === S.currentConvId) {
+      var textEl = indicator.querySelector(".working-indicator-text");
+      if (textEl && textEl.firstChild && textEl.firstChild.nodeValue !== "排队中") {
+        textEl.firstChild.nodeValue = "排队中";
+      }
+    } else {
+      var textEl2 = indicator.querySelector(".working-indicator-text");
+      if (textEl2 && textEl2.firstChild && textEl2.firstChild.nodeValue !== "正在工作") {
+        textEl2.firstChild.nodeValue = "正在工作";
+      }
+    }
+    if (area.lastElementChild !== indicator) area.appendChild(indicator);
+  } else if (indicator) {
+    indicator.remove();
+  }
 }
 
 // 构建完整消息节点
@@ -169,10 +222,11 @@ function updateMessageNode(el, msg) {
   var struct = msgStructSig(msg, role);
   if (struct === "plain" || el._admStruct !== struct) return false;
   var partEls = el.querySelectorAll(":scope > [data-pk]");
+  var hiddenCallIds = unavailableToolCallIds(msg.parts);
   var pi = 0;
   for (var i = 0; i < msg.parts.length; i++) {
     var part = msg.parts[i];
-    if (!isPartRenderable(part, role)) continue;
+    if (!isPartRenderable(part, role, hiddenCallIds)) continue;
     var pe = partEls[pi++];
     if (!pe || pe.getAttribute("data-ptype") !== part.type) return false;
     var d = part.data || {};
@@ -210,7 +264,7 @@ function updateMessageNode(el, msg) {
         if (pe.getAttribute("src") !== (d.url || "")) pe.setAttribute("src", d.url || "");
         break;
       case "binary":
-        pe.textContent = "📎 附件: " + (d.path || "file") + " (" + (d.mime_type || "unknown") + ")";
+        pe.textContent = "📎 附件: " + (d.path || d.Path || "file") + " (" + (d.mime_type || d.MIMEType || "unknown") + ")";
         break;
       default:
         // shell_command / 未知类型：内部结构随数据变化，仅重建该 part 元素（无 details，不影响点击）
@@ -226,8 +280,9 @@ function updateMessageNode(el, msg) {
 
 // 渲染 ContentPart 数组（msgKey 用于给折叠块生成稳定 data-key，重渲染时恢复展开状态）
 function renderMessageParts(container, parts, role, msgKey) {
+  var hiddenCallIds = unavailableToolCallIds(parts);
   parts.forEach(function(part, partIdx) {
-    if (!isPartRenderable(part, role)) return;
+    if (!isPartRenderable(part, role, hiddenCallIds)) return;
     var el = buildPartElement(part, partIdx, role, msgKey);
     if (!el) return;
     el.setAttribute("data-pk", String(partIdx));
@@ -256,10 +311,10 @@ function buildPartElement(part, partIdx, role, msgKey) {
       details.setAttribute("data-key", partKey);
       var summary = document.createElement("summary");
       summary.textContent = "💭 推理过程";
-      summary.style.cssText = "cursor:pointer;font-size:12px;color:#8b949e;";
+      summary.style.cssText = "cursor:pointer;font-size:12px;color:var(--c-text-3);";
       details.appendChild(summary);
       var reasoningContent = document.createElement("div");
-      reasoningContent.style.cssText = "padding:8px;color:#8b949e;font-style:italic;font-size:12px;white-space:pre-wrap;";
+      reasoningContent.style.cssText = "padding:8px;color:var(--c-text-3);font-style:italic;font-size:12px;white-space:pre-wrap;";
       reasoningContent.textContent = partData.thinking || "";
       details.appendChild(reasoningContent);
       return details;
@@ -271,10 +326,10 @@ function buildPartElement(part, partIdx, role, msgKey) {
       var toolSummary = document.createElement("summary");
       var finished = partData.finished !== false;
       toolSummary.textContent = "🔧 " + (partData.name || "tool") + (finished ? " (已完成)" : " (执行中)");
-      toolSummary.style.cssText = "cursor:pointer;font-size:12px;color:#8b949e;";
+      toolSummary.style.cssText = "cursor:pointer;font-size:12px;color:var(--c-text-3);";
       toolDetails.appendChild(toolSummary);
       var toolInput = document.createElement("div");
-      toolInput.style.cssText = "padding:8px;font-family:monospace;font-size:11px;color:#b0b8c8;white-space:pre-wrap;background:#0d1117;border-radius:4px;margin-top:4px;";
+      toolInput.style.cssText = "padding:8px;font-family:monospace;font-size:11px;color:var(--c-text-2);white-space:pre-wrap;background:var(--c-bg-deep);border-radius:4px;margin-top:4px;";
       try {
         toolInput.textContent = "输入: " + JSON.stringify(JSON.parse(partData.input || "{}"), null, 2);
       } catch (_) {
@@ -293,7 +348,7 @@ function buildPartElement(part, partIdx, role, msgKey) {
       resultSummary.style.cssText = "cursor:pointer;font-size:12px;color:" + (isError ? "#ff6b6b" : "#43a047") + ";";
       resultDetails.appendChild(resultSummary);
       var resultContent = document.createElement("div");
-      resultContent.style.cssText = "padding:8px;font-family:monospace;font-size:11px;color:#b0b8c8;white-space:pre-wrap;background:#0d1117;border-radius:4px;margin-top:4px;max-height:300px;overflow-y:auto;";
+      resultContent.style.cssText = "padding:8px;font-family:monospace;font-size:11px;color:var(--c-text-2);white-space:pre-wrap;background:var(--c-bg-deep);border-radius:4px;margin-top:4px;max-height:300px;overflow-y:auto;";
       resultContent.textContent = partData.content || partData.data || "";
       resultDetails.appendChild(resultContent);
       return resultDetails;
@@ -302,7 +357,7 @@ function buildPartElement(part, partIdx, role, msgKey) {
       // 用户消息的 finish 已在 isPartRenderable 中过滤
       var finishDiv = document.createElement("div");
       finishDiv.className = "msg-finish";
-      finishDiv.style.cssText = "border-top:1px solid #30363d;padding-top:4px;margin-top:4px;font-size:11px;color:#6e7681;";
+      finishDiv.style.cssText = "border-top:1px solid var(--c-border);padding-top:4px;margin-top:4px;font-size:11px;color:var(--c-text-4);";
       var reason = partData.reason || "完成";
       finishDiv.textContent = "── " + reason + " ──";
       return finishDiv;
@@ -310,20 +365,20 @@ function buildPartElement(part, partIdx, role, msgKey) {
     case "shell_command":
       var shellDiv = document.createElement("div");
       shellDiv.className = "msg-shell-command";
-      shellDiv.style.cssText = "font-family:monospace;font-size:11px;background:#0d1117;border-radius:4px;padding:8px;margin-top:4px;";
+      shellDiv.style.cssText = "font-family:monospace;font-size:11px;background:var(--c-bg-deep);border-radius:4px;padding:8px;margin-top:4px;";
       var cmdDiv = document.createElement("div");
-      cmdDiv.style.cssText = "color:#6c63ff;";
+      cmdDiv.style.cssText = "color:var(--c-accent);";
       cmdDiv.textContent = "$ " + (partData.command || "");
       shellDiv.appendChild(cmdDiv);
       if (partData.output) {
         var outDiv = document.createElement("div");
-        outDiv.style.cssText = "color:#b0b8c8;white-space:pre-wrap;margin-top:4px;";
+        outDiv.style.cssText = "color:var(--c-text-2);white-space:pre-wrap;margin-top:4px;";
         outDiv.textContent = partData.output;
         shellDiv.appendChild(outDiv);
       }
       if (partData.exit_code !== undefined) {
         var exitDiv = document.createElement("div");
-        exitDiv.style.cssText = "color:#6e7681;margin-top:4px;";
+        exitDiv.style.cssText = "color:var(--c-text-4);margin-top:4px;";
         exitDiv.textContent = "退出码: " + partData.exit_code;
         shellDiv.appendChild(exitDiv);
       }
@@ -337,14 +392,14 @@ function buildPartElement(part, partIdx, role, msgKey) {
 
     case "binary":
       var binDiv = document.createElement("div");
-      binDiv.style.cssText = "font-size:12px;color:#8b949e;padding:4px 0;";
-      binDiv.textContent = "📎 附件: " + (partData.path || "file") + " (" + (partData.mime_type || "unknown") + ")";
+      binDiv.style.cssText = "font-size:12px;color:var(--c-text-3);padding:4px 0;";
+      binDiv.textContent = "📎 附件: " + (partData.path || partData.Path || "file") + " (" + (partData.mime_type || partData.MIMEType || "unknown") + ")";
       return binDiv;
 
     default:
       // 未知类型，显示原始 JSON
       var unknownDiv = document.createElement("div");
-      unknownDiv.style.cssText = "font-size:11px;color:#6e7681;";
+      unknownDiv.style.cssText = "font-size:11px;color:var(--c-text-4);";
       unknownDiv.textContent = JSON.stringify(part);
       return unknownDiv;
   }

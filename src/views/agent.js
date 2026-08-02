@@ -4,17 +4,19 @@
 import { template } from "./agent/template.js";
 import { S, invoke, listen } from "./agent/state.js";
 import { api } from "./agent/api.js";
-import { generateUUID, isMsgAreaAtBottom, autoResize, $input } from "./agent/utils.js";
-import { updateStatusBar, updateContextUsage, updateModeToggle, updateSendButton, exitManualScrollMode, startSendSafetyTimer, clearSendSafetyTimer, showError, showConfirm, showCopyPasteMenu, updateScrollBottomBtn } from "./agent/ui.js";
+import { generateUUID, isMsgAreaAtBottom, autoResize, $input, normalizeReasoningEffort } from "./agent/utils.js";
+import { updateStatusBar, updateContextUsage, updateModeToggle, updateSendButton, exitManualScrollMode, startSendSafetyTimer, clearSendSafetyTimer, showError, showConfirm, showCopyPasteMenu, updateScrollBottomBtn, reportError } from "./agent/ui.js";
 import { loadConversations, renderConversationList, selectConversation, newConversation } from "./agent/session.js";
+import { syncWorkingIndicator } from "./agent/render.js";
 import { sendMessage } from "./agent/send.js";
 import { setupSSEListener } from "./agent/sse.js";
-import { syncYoloToServer } from "./agent/permission.js";
+import { syncModeToServer } from "./agent/permission.js";
 import { loadTools, renderToolsList } from "./agent/tools.js";
 import { switchModel, refreshServerProviders, resolveAgentModel, updateModelDropdown, updateModelBtn } from "./agent/model.js";
 import { enableAutoCompact, updateWorkspaceSelector } from "./agent/workspace.js";
-import { showSettings, hideSettings, updateSettingsUI, saveSettings, checkAgentVersion, showAddModelDialog, hideAddModelDialog, addModel } from "./agent/settings_dialog.js";
-import { addPendingFiles } from "./agent/attach.js";
+import { showSettings, hideSettings, updateSettingsUI, saveSettings, showAddModelDialog, hideAddModelDialog, addModel, initProjectMemoryUI } from "./agent/settings_dialog.js";
+import { addPendingFiles, parseUriListPaths, addPastedPaths, looksLikeFilePath } from "./agent/attach.js";
+import { setAutoContinueEnabled } from "./agent/autocontinue.js";
 
 // ===== 初始化 =====
 async function init() {
@@ -33,18 +35,16 @@ async function init() {
   // 更新状态栏
   updateStatusBar("ready", null, 0);
 
-  // 检查 admAgent 是否已下载
+  // 检查 admAgent 是否存在（安装包内置 sidecar，缺失属于安装损坏，无运行时下载兜底）
   try {
     var agentCheck = await invoke("check_adm_agent");
     if (!agentCheck || !agentCheck.exists) {
-      showError("未找到 admAgent 工具，请先下载");
+      showError("未找到 admAgent 组件（应随安装包内置），请重新安装 ADM");
       updateStatusBar("error", null, 0);
-      // 显示下载引导
-      showDownloadGuide();
       return;
     }
   } catch (e) {
-    showError("检查 admAgent 失败: " + e);
+    reportError(e, { prefix: "检查 admAgent 失败: " });
     updateStatusBar("error", null, 0);
     return;
   }
@@ -61,13 +61,13 @@ async function init() {
       console.log("[agent] Agent 服务已启动, port:", S.serverInfo?.port);
       } catch (e) {
         console.error("[agent] 启动 Agent 服务失败:", e);
-        showError("启动 Agent 服务失败: " + e);
+        reportError(e, { prefix: "启动 Agent 服务失败: " });
         updateStatusBar("error", null, 0);
         return;
       }
     }
   } catch (e) {
-    showError("检查 Agent 服务状态失败: " + e);
+    reportError(e, { prefix: "检查 Agent 服务状态失败: " });
     updateStatusBar("error", null, 0);
     return;
   }
@@ -91,7 +91,7 @@ async function init() {
         if (!S.workspaceInfo) {
           const newWs = await api("POST", "/v1/workspaces", {
             path: workdir,
-            yolo: S.settings.agent_yolo || false,
+            yolo: true, // 审批模式已移除：权限请求直通，Plan 模式靠服务端只读工具集约束
             client_id: S.clientId
           });
           S.workspaceInfo = { id: newWs.id, path: newWs.path, name: newWs.path.split(/[\\/]/).pop() };
@@ -151,12 +151,17 @@ async function init() {
       console.warn("[agent] 获取 agentInfo 失败:", e);
     }
 
-    // 把本地 YOLO 设置同步到服务端（复用已有工作区时服务端保留的是旧状态，可能与本地不一致）
-    await syncYoloToServer();
+    // 把本地模式（skip 直通 + Plan 开关）同步到服务端（复用已有工作区时服务端保留的是旧状态，可能与本地不一致）
+    await syncModeToServer();
 
     // 全局默认开启自动压缩（Compact 模式）
     await enableAutoCompact();
   }
+  if (seq !== S.initSeq) return;
+
+  // 监听 SSE 事件（必须先于 loadConversations：selectConversation 会 POST /current-session
+  // 上报在场会话，服务端要求该 client_id 已挂活跃 SSE 流，否则返回 404 client not attached）
+  await setupSSEListener();
   if (seq !== S.initSeq) return;
 
   // 加载会话列表（restoreCurrent=true：重新挂载时 DOM 已重置，即使 currentConvId 仍有值也必须重新 selectConversation 渲染聊天区）
@@ -182,25 +187,16 @@ async function init() {
     });
   }
 
-  // 检查 admAgent 版本
-  checkAgentVersion();
-
   // 更新 UI
   updateModelDropdown();
   updateModeToggle();
   updateSettingsUI();
 
   if (seq !== S.initSeq) return;
-  // 监听 SSE 事件
-  await setupSSEListener();
-
   // 发送态对账：S 是模块级状态，isSending/activeRun 跨挂载周期残留；
   // unmount 期间 SSE 监听器已解绑，run_complete 在页面切走时到达会永久丢失，
   // 重新挂载后必须以服务端 is_busy 为准校准，否则「正在思考」永远卡住
   await reconcileSendingState();
-
-  // SSE 连接建立后重新加载工具列表，确保 skills_event 等发现事件不遗漏
-  await loadTools();
 
   // 工作区选择器为纯展示，不支持点击切换（切换工作目录请去设置弹窗）
 
@@ -208,66 +204,60 @@ async function init() {
   checkProjectInit();
 }
 
-// 重新挂载后校准残留的发送态：运行会话仍忙则恢复「取消」按钮与安全计时器，
-// 已结束（run_complete 在切走期间丢失）则重置，updateSendButton 会同步移除思考指示器
+// 重新挂载后校准残留的发送态。
+//
+// 难点：发送后到模型真正产出 token 之间有「启动窗口」（服务端 readyWg/UpdateModels、
+// 本地模型加载，可达数秒）。旧版 admAgent 在此窗口内 is_busy=false，单次快照会把
+// 「仍在启动的运行」误判为已结束、抹掉指示器（日志实测：is_busy=false 后 4s 才出首个 token）。
+//
+// 策略：SSE 已在此前重订，运行若仍活跃，其 run_complete 结束时必会到达并收尾发送态。
+// 因此这里乐观保留发送态与指示器，只有在「服务端不忙 且 最后一条已是完成的助手轮次」
+// （即运行确已在切走期间结束、run_complete 丢失）时才重置。这样无论后端新旧都正确。
 async function reconcileSendingState() {
   if (!S.isSending) return;
   var run = S.activeRun;
-  var busy = false;
-  if (run) {
-    try {
-      var sess = await api("GET", "/v1/workspaces/" + run.workspaceId + "/sessions/" + run.sessionId);
-      busy = !!(sess && sess.is_busy);
-    } catch (_) {}
-  }
-  if (busy) {
+  if (!run) {
+    S.isSending = false;
+    S.queuedRun = null;
     updateSendButton();
-    startSendSafetyTimer();
-  } else {
-    console.warn("[agent] 挂载对账：残留 isSending 但运行会话已结束，重置发送态");
+    updateStatusBar("ready", null, S.contextUsage.used);
+    return;
+  }
+
+  // 先乐观恢复运行态 UI（指示器/按钮是纯 DOM，重新挂载后不会随 S 残留）
+  updateSendButton();
+  syncWorkingIndicator();
+  startSendSafetyTimer();
+
+  var busy = true; // 查询失败时保守当作仍在运行，交由 SSE / 安全计时器兜底
+  try {
+    var sess = await api("GET", "/v1/workspaces/" + run.workspaceId + "/sessions/" + run.sessionId);
+    busy = !!(sess && sess.is_busy);
+  } catch (_) {}
+  if (S.activeRun !== run || !S.isSending) return; // 期间已被 SSE/取消收尾
+  console.log("[agent] reconcile 对账: is_busy=" + busy + " lastFinished=" + lastAssistantTurnFinished());
+
+  // 仅当服务端确认不忙、且消息区已存在完成的助手轮次时，才认定运行已结束并重置。
+  // 启动窗口内（尚无助手输出）即便 is_busy=false 也保留指示器，等待 SSE 流继续。
+  if (!busy && lastAssistantTurnFinished()) {
+    console.warn("[agent] 挂载对账：运行会话已结束，重置发送态");
     S.isSending = false;
     S.activeRun = null;
+    S.queuedRun = null;
+    clearSendSafetyTimer();
     updateSendButton();
     updateStatusBar("ready", null, S.contextUsage.used);
   }
 }
 
-// 显示下载引导
-function showDownloadGuide() {
-  var area = document.getElementById("agent-msg-area");
-  if (area) {
-    area.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;color:#b0b8c8;">' +
-      '<div style="font-size:48px;">📦</div>' +
-      '<div style="font-size:16px;font-weight:600;">需要下载 admAgent 工具</div>' +
-      '<div style="font-size:13px;color:#8b949e;text-align:center;max-width:400px;">' +
-        'admAgent 是 Agent 功能的核心组件，需要下载后才能使用。<br>请点击下方按钮开始下载。' +
-      '</div>' +
-      '<button id="agent-download-btn" style="background:#6c63ff;color:#fff;border:none;padding:10px 24px;border-radius:8px;font-size:14px;cursor:pointer;">' +
-        '下载 admAgent' +
-      '</button>' +
-      '</div>';
-
-    // 绑定下载按钮事件
-    setTimeout(function() {
-      var btn = /** @type {HTMLButtonElement} */ (document.getElementById("agent-download-btn"));
-      if (btn) {
-        btn.addEventListener("click", async function() {
-          btn.disabled = true;
-          btn.textContent = "下载中...";
-          try {
-            await invoke("download_adm_agent");
-            btn.textContent = "下载完成，正在启动...";
-            // 重新初始化
-            setTimeout(function() { init(); }, 1000);
-          } catch (e) {
-            btn.textContent = "下载失败，点击重试";
-            btn.disabled = false;
-            showError("下载失败: " + e);
-          }
-        });
-      }
-    }, 0);
-  }
+// 当前消息列表的最后一条是否为「已完成的助手轮次」（带 finish part）。
+// 运行结束时助手消息以 finish 收尾；用于判断运行是否已在页面切走期间结束。
+function lastAssistantTurnFinished() {
+  var msgs = S.messages;
+  if (!Array.isArray(msgs) || msgs.length === 0) return false;
+  var last = msgs[msgs.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  return Array.isArray(last.parts) && last.parts.some(function(p) { return p && p.type === "finish"; });
 }
 
 // ===== admAgent server 意外退出自愈 =====
@@ -281,6 +271,7 @@ async function handleServerDied() {
   showError("admAgent 服务异常退出，正在自动重启...");
   S.isSending = false;
   S.activeRun = null;
+  S.queuedRun = null;
   updateSendButton();
   clearSendSafetyTimer();
   updateStatusBar("error", null, S.contextUsage.used);
@@ -288,7 +279,7 @@ async function handleServerDied() {
     await init();
   } catch (e) {
     console.error("[agent] admAgent 自动重启失败:", e);
-    showError("admAgent 自动重启失败: " + e);
+    reportError(e, { prefix: "admAgent 自动重启失败: " });
   } finally {
     serverRestarting = false;
   }
@@ -324,7 +315,7 @@ function bindEvents() {
         await invoke("set_ilink_follow", { enabled: turningOn });
       } catch (e) {
         wxBtn.classList.toggle("on", !turningOn); // 失败回滚显示
-        showError("切换微信消息开关失败: " + e);
+        reportError(e, { prefix: "切换微信消息开关失败: " });
       }
     });
   })();
@@ -342,34 +333,62 @@ function bindEvents() {
   // 设置按钮 (在侧栏底部)
   document.getElementById("agent-settings-btn").addEventListener("click", showSettings);
   document.getElementById("agent-settings-close").addEventListener("click", hideSettings);
-  document.getElementById("agent-settings-cancel").addEventListener("click", hideSettings);
-  document.getElementById("agent-settings-save").addEventListener("click", doSaveAndClose);
+  // 项目记忆折叠块交互（默认折叠）
+  initProjectMemoryUI();
 
-  // 浏览工作目录
+  // 设置项即时生效：任一字段变更立即应用并持久化（无保存/取消按钮）
+  ["settings-plan", "settings-auto-continue", "settings-debug-logging", "settings-reasoning-effort", "settings-temperature"].forEach(function(id) {
+    $input(id).addEventListener("change", applySettings);
+  });
+
+  // 浏览工作目录（选完目录后自动关闭设置弹窗）
   document.getElementById("settings-browse-btn").addEventListener("click", async function() {
     try {
       var dir = await invoke("pick_workdir_folder");
       if (dir) {
         $input("settings-workdir").value = dir;
-        await doSaveAndClose();
+        await applySettings();
+        hideSettings();
       }
     } catch (_) {}
   });
 
-  // 工作目录输入框变更时自动保存
-  $input("settings-workdir").addEventListener("change", async function() {
-    if ($input("settings-workdir").value.trim()) await doSaveAndClose();
+  // 打开调试日志目录（在系统文件管理器中定位 adm_api_debug.log）
+  document.getElementById("settings-open-log-dir").addEventListener("click", async function() {
+    try {
+      await invoke("open_debug_log_dir");
+    } catch (e) {
+      reportError(e, { prefix: "打开日志目录失败: " });
+    }
   });
 
-  // 从所有设置弹窗字段读取并保存，然后关闭
-  async function doSaveAndClose() {
-    S.settings.agent_reasoning_effort = $input("settings-reasoning-effort").value;
+  // 工作目录输入框变更时自动保存
+  $input("settings-workdir").addEventListener("change", async function() {
+    if ($input("settings-workdir").value.trim()) await applySettings();
+  });
+
+  // 从所有设置弹窗字段读取并保存（即时生效，弹窗保持打开）
+  async function applySettings() {
+    S.settings.agent_reasoning_effort = normalizeReasoningEffort($input("settings-reasoning-effort").value);
     var tempVal = $input("settings-temperature").value;
     S.settings.agent_temperature = tempVal ? parseFloat(tempVal) : null;
-    S.settings.agent_yolo = $input("settings-yolo").checked;
+    S.settings.agent_plan_mode = $input("settings-plan").checked;
+    setAutoContinueEnabled($input("settings-auto-continue").checked);
+    // 调试模式：先同步后端开关（实时生效 + 开启时首次截断日志），再随 settings 持久化。
+    // 后端切换失败（如日志文件创建失败）时必须回滚状态，否则会把 debug_logging=true
+    // 写盘，造成“勾选着、配置为开、实际没记录”的假开启态（且跨重启延续）。
+    var debugLogging = $input("settings-debug-logging").checked;
+    try {
+      await invoke("set_debug_logging", { enabled: debugLogging });
+      S.settings.debug_logging = debugLogging;
+    } catch (e) {
+      console.warn("[agent] 切换调试日志失败:", e);
+      S.settings.debug_logging = false;
+      $input("settings-debug-logging").checked = false;
+      reportError(e, { prefix: "开启调试日志失败: " });
+    }
     await saveSettings();
-    await syncYoloToServer();
-    hideSettings();
+    await syncModeToServer();
     updateModeToggle();
     updateModelBtn();
     var selectedKey = S.settings.agent_default_provider || "local";
@@ -383,13 +402,13 @@ function bindEvents() {
   // 云端模型管理
   document.getElementById("agent-add-cloud-btn").addEventListener("click", showAddModelDialog);
 
-  // 模式切换 (工具栏)
+  // 模式切换 (工具栏)：执行 ↔ Plan（只读计划）
   document.getElementById("agent-mode-toggle").addEventListener("click", async function() {
-    S.settings.agent_yolo = !S.settings.agent_yolo;
+    S.settings.agent_plan_mode = !S.settings.agent_plan_mode;
     updateModeToggle();
     await saveSettings();
-    // 实时同步到服务端，对话中途切换立即生效
-    await syncYoloToServer();
+    // 实时同步到服务端，对话中途切换下一轮生效
+    await syncModeToServer();
   });
 
   // 模型下拉
@@ -414,7 +433,8 @@ function bindEvents() {
     var input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
-    input.accept = "image/*";
+    // 仅支持图片 + 文本类附件（与 attach.js 白名单一致）；其余格式由 addPendingFiles 提示"暂不支持"
+    input.accept = "image/*,.txt,.log,.md,.markdown,.json,.csv,.xml,.yaml,.yml,.ini,.conf,.env,.sql,.js,.mjs,.ts,.py,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sh,.bat,.ps1,.html,.css,.scss";
     input.onchange = function() {
       var files = input.files;
       if (files && files.length > 0) {
@@ -449,11 +469,12 @@ function bindEvents() {
     });
   }
 
-  // Ctrl+V 粘贴图片
+  // Ctrl+V 粘贴：图片直读剪贴板 blob；文本等文件（剪贴板只带 file:// 路径）走 Tauri 读取
   var inputEl = document.getElementById("agent-input");
   inputEl.addEventListener("paste", function(e) {
-    var clipItems = e.clipboardData && e.clipboardData.items;
-    if (!clipItems) return;
+    var cd = e.clipboardData;
+    if (!cd) return;
+    var clipItems = cd.items;
     var imageFiles = [];
     for (var i = 0; i < clipItems.length; i++) {
       if (clipItems[i].type.indexOf("image/") === 0) {
@@ -464,7 +485,61 @@ function bindEvents() {
     if (imageFiles.length > 0) {
       e.preventDefault();
       addPendingFiles(imageFiles);
+      return;
     }
+    // 无图片：尝试读取文件路径（复制文件时剪贴板提供 text/uri-list 或 text/plain 路径）
+    // text/uri-list 格式：每行是一个 URI（file:// 或 http(s)），parseUriListPaths 负责解析
+    var uriList = cd.getData("text/uri-list");
+    var paths = parseUriListPaths(uriList);
+    if (paths.length === 0) {
+      // 兜底1：text/plain 里可能是文件路径（Windows 资源管理器复制文件常见）。
+      // 注意：不能用 parseUriListPaths 解析普通文本 —— 该函数会把任意非空行都当路径，
+      // 导致正常文本粘贴被误拦截。必须用 looksLikeFilePath 逐行/整体校验。
+      var plain = (cd.getData("text/plain") || "").trim();
+      if (plain && looksLikeFilePath(plain)) {
+        // 多行且每行都像路径 → 拆成多行各自作为路径
+        if (plain.indexOf("\n") >= 0 || plain.indexOf("\r") >= 0) {
+          var lines = plain.split(/\r?\n/).map(function(l) { return l.trim(); }).filter(Boolean);
+          // 二次校验：只保留真正像路径的行（looksLikeFilePath 对多行返回 true 仅表示每行都像，
+          // 但为安全起见再加一次过滤）
+          paths = lines.filter(function(l) { return looksLikeFilePath(l); });
+          if (paths.length === 0) paths = [];
+        } else {
+          paths = [plain];
+        }
+      }
+    }
+    if (paths.length === 0 && cd.files && cd.files.length > 0) {
+      // 兜底2：File 对象（WebView2 可能暴露 .path）
+      for (var fi = 0; fi < cd.files.length; fi++) {
+        var pf = cd.files[fi];
+        if (pf && typeof pf["path"] === "string" && pf["path"]) paths.push(pf["path"]);
+      }
+    }
+    if (paths.length > 0) {
+      e.preventDefault();
+      addPastedPaths(paths);
+      return;
+    }
+    // 兜底3：WebView2 不暴露文件路径给 DataTransfer，Rust 侧直读剪贴板 CF_HDROP。
+    // DataTransfer 出现非图片 file 项即说明剪贴板是"复制文件"：同步拦截默认粘贴，
+    // 避免路径文本被插入输入框；随后异步读取 CF_HDROP 路径列表。
+    // CF_HDROP 只在"复制文件"时存在，正常复制文本时不会走到这里，无副作用。
+    try {
+      var hasFileItem = false;
+      for (var fi2 = 0; fi2 < clipItems.length; fi2++) {
+        if (clipItems[fi2].kind === "file" && clipItems[fi2].type.indexOf("image/") !== 0) {
+          hasFileItem = true;
+          break;
+        }
+      }
+      if (hasFileItem) {
+        e.preventDefault();
+        invoke("read_clipboard_files").then(function(files) {
+          if (files && files.length > 0) addPastedPaths(files);
+        }).catch(function() {});
+      }
+    } catch (_) {}
   });
 
   // 标题栏操作按钮
@@ -473,7 +548,7 @@ function bindEvents() {
     showConfirm("确定撤销上一轮对话？此操作会回退上一轮产生的消息与文件修改。", function() {
       api("POST", "/v1/workspaces/" + S.serverInfo.workspace_id + "/agent/sessions/" + S.currentConvId + "/undo")
         .then(function() { selectConversation(S.currentConvId); })
-        .catch(function(e) { showError("撤销失败: " + e); });
+        .catch(function(e) { reportError(e, { prefix: "撤销失败: " }); });
     });
   });
 
@@ -581,8 +656,8 @@ function showProjectInitDialog() {
 
   // 显示初始化引导提示
   var initDiv = document.createElement("div");
-  initDiv.style.cssText = "background:rgba(108,99,255,0.1);border:1px solid #6c63ff;border-radius:8px;padding:12px;margin-bottom:16px;";
-  initDiv.innerHTML = "<strong>� 项目初始化</strong><p style='margin-top:4px;font-size:12px;color:#b0b8c8;'>检测到项目需要初始化，建议运行初始化流程以启用完整功能。</p>";
+  initDiv.style.cssText = "background:rgba(var(--c-accent-rgb),0.1);border:1px solid var(--c-accent);border-radius:8px;padding:12px;margin-bottom:16px;";
+  initDiv.innerHTML = "<strong>� 项目初始化</strong><p style='margin-top:4px;font-size:12px;color:var(--c-text-2);'>检测到项目需要初始化，建议运行初始化流程以启用完整功能。</p>";
   body.insertBefore(initDiv, body.firstChild);
 }
 
@@ -598,21 +673,27 @@ export default {
       listen("agent-server-died", handleServerDied)
         .then(function(u) { S.unlisteners.push(u); })
         .catch(function() {});
+      // 微信端 /plan、/yolo 切换模式后，Rust 发此事件让 Agent 页按钮跟随（两端一致）。
+      // 仅更新内存态 + 按钮：config.json 已由微信端写盘、服务端已同步，无需再 save/sync 避免回环。
+      listen("agent-mode-changed", function(e) {
+        if (!S.settings) return;
+        S.settings.agent_plan_mode = !!(e && e.payload && e.payload.plan);
+        updateModeToggle();
+      })
+        .then(function(u) { S.unlisteners.push(u); })
+        .catch(function() {});
     }
     // init 是 fire-and-forget，必须兜底 catch，否则任何未捕获异常都是静默死亡（表现为页面空白无报错）
     init().catch(function(e) {
       console.error("[agent] init() 未捕获异常:", e);
-      showError("Agent 页面初始化失败: " + e);
+      reportError(e, { prefix: "Agent 页面初始化失败: " });
     });
   },
   unmount() {
-    console.log("[agent] unmount()");
+    console.log("[agent] unmount() isSending=" + S.isSending + " activeRun=" + JSON.stringify(S.activeRun));
     // 使在途 init() 失效，防止切走后旧 init 继续执行、或与下次 mount 的新 init 并发互踩
     S.initSeq++;
     S.pendingFiles = [];
-    // 重置权限弹窗状态（避免残留的 currentPermission 导致重新进入后新请求被误判为"弹窗已打开"而永久排队）
-    S.pendingPermissions = [];
-    S.currentPermission = null;
     // 重置手动滚动模式
     exitManualScrollMode();
     clearSendSafetyTimer();

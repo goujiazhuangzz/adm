@@ -118,9 +118,9 @@ pub struct Settings {
 pub launch_params: LaunchParams,
 #[serde(default)]
 pub agent_workdir: String,
-/// Agent YOLO 模式：跳过所有权限确认
+/// Agent Plan 模式：只读调研并产出计划，不修改任何文件（false = 执行模式直通）
 #[serde(default)]
-pub agent_yolo: bool,
+pub agent_plan_mode: bool,
 /// Agent 默认 Provider（如 "local" / "xiaomimimo" 等）
 #[serde(default)]
 pub agent_default_provider: String,
@@ -130,6 +130,9 @@ pub agent_reasoning_effort: String,
 /// Agent 采样温度
 #[serde(default)]
 pub agent_temperature: Option<f64>,
+/// 调试模式：开启后在软件根目录记录 admAgent API/SSE 交互日志（每次重启自动清空）
+#[serde(default)]
+pub debug_logging: bool,
 }
 
 impl Default for Settings {
@@ -137,10 +140,11 @@ fn default() -> Self {
 Self {
 launch_params: LaunchParams::default(),
 agent_workdir: String::new(),
-agent_yolo: false,
+agent_plan_mode: false,
 agent_default_provider: String::new(),
 agent_reasoning_effort: String::new(),
 agent_temperature: None,
+debug_logging: false,
 }
 }
 }
@@ -178,14 +182,6 @@ pub struct UpdateCheckResult {
     pub llamacpp_local_version: Option<String>,
     pub llamacpp_download_url: Option<String>,
     pub vc_redist_installed: bool,
-}
-
-#[derive(Serialize, Clone)]
-pub struct AdmAgentUpdateCheck {
-    pub needs_update: bool,
-    pub remote_version: Option<String>,
-    pub local_version: Option<String>,
-    pub download_url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]

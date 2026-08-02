@@ -2,12 +2,14 @@
 import { S, invoke, listen } from "./state.js";
 import { api } from "./api.js";
 import { getTextFromParts } from "./utils.js";
-import { updateSendButton, updateStatusBar, startSendSafetyTimer, clearSendSafetyTimer, showError, updateContextUsage } from "./ui.js";
+import { getErrorMessage } from "./error.js";
+import { updateSendButton, updateStatusBar, startSendSafetyTimer, clearSendSafetyTimer, showError, showWarning, reportError, updateContextUsage } from "./ui.js";
 import { renderMessages, renderTodos } from "./render.js";
 import { loadConversations, refreshMessages, renderConversationList, selectConversation, syncWxFollowSession } from "./session.js";
-import { showPermissionDialog, resetPermissionState } from "./permission.js";
+import { handlePermissionRequest, resetPermissionState } from "./permission.js";
 import { loadTools } from "./tools.js";
 import { refreshAgentInfo, reloadAgentConfig } from "./model.js";
+import { maybeAutoContinue, resetAutoContinue } from "./autocontinue.js";
 
 // ===== SSE 事件 =====
 export async function setupSSEListener() {
@@ -65,10 +67,13 @@ function reconnectSSE() {
       if (S.isSending && S.activeRun) startSendSafetyTimer();
       updateStatusBar(S.isSending ? "busy" : "ready", null, S.contextUsage.used);
     } catch (e) {
-      showError("重连失败: " + e);
+      reportError(e, { prefix: "重连失败: " });
     }
   }, 3000);
 }
+
+// 错误格式化 / 分类统一收口到 error.js（getErrorMessage / classifyError），
+// 展示统一走 ui.js 的 reportError（quota 类错误自动提示"余额不足，任务中断"）。
 
 function handleSSEEvent(payload) {
   if (!payload) return;
@@ -86,6 +91,14 @@ function handleSSEEvent(payload) {
       // 只有实际运行会话的消息才能续期其安全计时器，其他会话事件不得干扰
       if (S.isSending && S.activeRun && (!actualData.session_id || actualData.session_id === S.activeRun.sessionId)) {
         startSendSafetyTimer();
+      }
+      // 排队结束信号：排队中的会话开始产出消息 → 已从「排队中」转入「运行中」，
+      // 清除排队标识并接管 activeRun（前序运行的 run_complete 可能晚到，不能因此误清状态）
+      if (S.queuedRun && actualData.session_id && actualData.session_id === S.queuedRun.sessionId) {
+        console.log("[agent] 排队会话开始产出，接管运行:", actualData.session_id);
+        S.activeRun = S.queuedRun;
+        S.queuedRun = null;
+        renderConversationList();
       }
       // 未打开任何会话时，后台会话（如微信 Bot）来消息 → 自动打开该会话实时跟踪
       if (!S.currentConvId && actualData.session_id) {
@@ -112,24 +125,50 @@ function handleSSEEvent(payload) {
         console.log("[agent] 忽略非当前运行的 run_complete:", actualData.run_id || actualData.session_id);
         break;
       }
-      S.isSending = false;
-      S.activeRun = null;
+      var tookOverQueued = false;
+      if (S.queuedRun) {
+        // 前序运行完成，排队运行接管：activeRun 切到排队运行，保持运行态连续
+        console.log("[agent] 前序运行完成，排队运行接管:", S.queuedRun.sessionId);
+        S.activeRun = S.queuedRun;
+        S.queuedRun = null;
+        tookOverQueued = true;
+        // 接管后运行即将开始（服务端队列 FIFO），重启安全计时器保护新运行
+        startSendSafetyTimer();
+      } else {
+        S.isSending = false;
+        S.activeRun = null;
+        clearSendSafetyTimer();
+      }
       updateSendButton();
-      clearSendSafetyTimer();
+      console.log("[agent] run_complete 收尾发送态: run_id=" + (actualData.run_id || "") + " session=" + (actualData.session_id || "") + " error=" + getErrorMessage(actualData.error) + " cancelled=" + !!actualData.cancelled);
       // 本轮运行出错/被取消时明确提示（error 非空表示运行出错），
       // 否则服务端中断本轮时 UI 静默停止，表现为"会话突然中断"却无任何说明
       if (actualData && actualData.error) {
         console.warn("[agent] run_complete 携带错误:", JSON.stringify(actualData));
         var ctxHint = (S.contextUsage.max > 0 && S.contextUsage.used >= S.contextUsage.max * 0.9)
           ? "（上下文已接近上限 " + S.contextUsage.used + "/" + S.contextUsage.max + "，建议新建会话继续）" : "";
-        showError("本轮对话中断: " + actualData.error + ctxHint);
+        // 统一错误展示：quota（余额不足/401）类自动提示"余额不足，任务中断"，其余显示原始错误
+        reportError(actualData.error, { prefix: "本轮对话中断: ", hint: ctxHint });
         updateStatusBar("error", null, S.contextUsage.used);
+        // 运行出错时不自动续跑（避免在持续性错误上循环烧 token）
+        resetAutoContinue();
       } else {
         if (actualData && actualData.cancelled) {
           showError("本轮对话已取消");
+          resetAutoContinue();
+        } else {
+          // 正常收尾：先做假完成检测（无 error 静默结束时的兜底提示），
+          // 再检查 todos 未完成时自动续跑（内部自带开关/进度守卫/轮数熔断）
+          detectFakeCompletion();
+          // 排队接管时不续跑已结束的前序会话（用户已转向其它会话，且其 prompt 正排队）
+          if (!tookOverQueued) maybeAutoContinue(actualData, S.runStats);
         }
-        updateStatusBar("ready", null, S.contextUsage.used);
+        // 排队接管时仍有运行在队列中，状态栏保持运行中，不切回就绪
+        if (!tookOverQueued) updateStatusBar("ready", null, S.contextUsage.used);
       }
+      // 本轮运行统计生命周期结束，清理避免跨轮残留；
+      // 排队接管时该统计属于排队中的会话（发送时已初始化），保留给其实际执行轮使用
+      if (!tookOverQueued) S.runStats = null;
       // 若切换模型时会话繁忙导致 /agent/update 未生效，本轮结束后立即重试重载
       if (S.pendingModelReload) {
         S.pendingModelReload = false;
@@ -147,7 +186,8 @@ function handleSSEEvent(payload) {
       }
       break;
     case "permission_request":
-      showPermissionDialog(actualData);
+      // 审批弹窗已移除：skip=true 下正常不会收到，竞态到达时自动放行
+      handlePermissionRequest(actualData);
       break;
     case "permission_notification":
       // 权限处理结果通知，可忽略或更新 UI
@@ -159,8 +199,7 @@ function handleSSEEvent(payload) {
       // Agent 事件（错误/响应/摘要）：error 可能是字符串或对象，统一展示并留完整日志便于排查
       if (actualData && actualData.error) {
         console.warn("[agent] agent_event 错误:", JSON.stringify(actualData).substring(0, 500));
-        var aerr = typeof actualData.error === "string" ? actualData.error : JSON.stringify(actualData.error);
-        showError("Agent 错误: " + aerr);
+        reportError(actualData.error, { prefix: "Agent 错误: " });
       }
       break;
     case "file":
@@ -177,6 +216,8 @@ function handleSSEEvent(payload) {
 
 // 处理消息 SSE 事件
 function handleMessageSSEEvent(action, msgData) {
+  // 统计本轮工具调用（增量按消息 id + parts 数去重），供假完成检测与续跑进度判定使用
+  if (action !== "deleted") collectRunStats(msgData);
   if (action === "created") {
     // 新消息创建 → 追加到消息列表（按 ID 去重）
     var existing = S.messages.find(function(m) { return m.id === msgData.id; });
@@ -210,6 +251,51 @@ function handleMessageSSEEvent(action, msgData) {
     S.messages = S.messages.filter(function(m) { return m.id !== msgData.id; });
     renderMessages();
   }
+}
+
+// ===== 本轮运行统计（假完成检测 / 续跑进度判定） =====
+// 副作用工具：会真实修改工作区/执行命令的工具。todos 不算（进度由 incomplete 数体现）
+var SIDE_EFFECT_TOOLS = ["edit", "write", "multiedit", "bash", "lsp_replace_symbol", "lsp_rename", "download", "agent"];
+// 触发"可能未完成"提示的工具调用次数上限（本轮工具调用 ≤ 该值且含副作用工具才提示）
+var FAKE_COMPLETE_TOOL_LIMIT = 4;
+// 操作型动词：prompt 命中这些词说明用户期望实际改动/部署/修复，而非纯问答
+var ACTION_VERB_RE = /部署|发布|修复|重构|改造|优化|统一|整理|处理|执行|修改|新建|迁移|实现|添加|删除|调整|合并|拆分|解决|完成|继续|开发|构建|设计|验证|测试|修复|安装|配置|清理/;
+
+// 统计消息中的工具调用（tool_call / tool_result part）
+function collectRunStats(msgData) {
+  var rs = S.runStats;
+  if (!rs || !msgData || !Array.isArray(msgData.parts)) return;
+  // 只统计与本次运行同一会话的消息：排队期间 activeRun 可能是其它会话，
+  // 其消息（session SSE 广播）不得计入本会话运行的统计，避免污染进度判定
+  if (msgData.session_id && rs.sessionId && msgData.session_id !== rs.sessionId) return;
+  var msgId = msgData.id || "";
+  if (!msgId) return;
+  var seenParts = rs.seenMsgIds[msgId] || 0;
+  var parts = msgData.parts;
+  if (parts.length <= seenParts) return; // 该消息 parts 未新增，无需重复统计
+  for (var i = seenParts; i < parts.length; i++) {
+    var p = parts[i];
+    if (!p || !p.data) continue;
+    var d = p.data;
+    if (p.type === "tool_call" && typeof d.name === "string") {
+      rs.toolCalls++;
+      if (SIDE_EFFECT_TOOLS.indexOf(d.name) >= 0) rs.sideEffectCalls++;
+    } else if (p.type === "tool_result" && typeof d.name === "string") {
+      if (SIDE_EFFECT_TOOLS.indexOf(d.name) >= 0 && !d.is_error) rs.sideEffectSuccess++;
+    }
+  }
+  rs.seenMsgIds[msgId] = parts.length;
+}
+
+// 假完成/静默停止检测：本轮有副作用工具调用、但工具调用总数过少、且任务含操作型动词，
+// 说明模型可能草草收尾（未真正完成改动）。给出提示而非完全静默。
+function detectFakeCompletion() {
+  var rs = S.runStats;
+  if (!rs || rs.toolCalls === 0) return;        // 纯问答（无工具）不检测
+  if (rs.sideEffectCalls === 0) return;         // 只读/无副作用任务不检测
+  if (rs.toolCalls > FAKE_COMPLETE_TOOL_LIMIT) return; // 工具调用足够多，任务正常推进
+  if (!ACTION_VERB_RE.test(rs.prompt || "")) return;   // 非操作型动词（如"帮我看看"）不提示
+  showWarning("本轮对话已结束，但工具调用较少（" + rs.toolCalls + " 次），任务可能未完整执行。请确认结果，如有遗漏请补充说明继续。");
 }
 
 // 处理会话 SSE 事件

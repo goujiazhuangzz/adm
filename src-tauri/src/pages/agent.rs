@@ -3,11 +3,9 @@
 use crate::app_state::{AppState, AgentServerSession};
 use crate::common::config;
 use crate::common::types::Settings;
-use crate::common::types::AdmAgentUpdateCheck;
 use crate::common::utils::platform;
 use crate::common::error::AppError;
 use crate::bail;
-use crate::pages::index::fetch_update_info;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -55,20 +53,16 @@ fn save_agent_workdir(app: &tauri::AppHandle, workdir: &str) -> Result<(), AppEr
     Ok(())
 }
 
-// ===== 平台相关路径与下载地址 =====
+// ===== 平台相关路径 =====
 
-/// admAgent 默认存放目录：
-/// - Windows：软件所在根目录（可执行文件所在目录）
-/// - macOS：应用用户目录（app_data_dir，如 ~/Library/Application Support/com.adm.admapp）
+/// admAgent 存放目录（安装包内置 sidecar，不再运行时下载）：
+/// - Windows：软件所在根目录（NSIS 把 sidecar 装在 ADM.exe 旁）
+/// - macOS：ADM.app/Contents/MacOS（Tauri externalBin 打包位置，即主程序所在目录）
 #[allow(unused_variables)]
 fn adm_agent_target_dir(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         config::get_exe_dir()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        config::get_data_dir(Some(app))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -85,75 +79,18 @@ fn adm_agent_file_name() -> &'static str {
     }
 }
 
-/// 从远程 admAgentVersion 字段（如 "v0.1.0-ec0848"）提取主版本号（如 "0.1.0"）。
-fn extract_major_version(remote_ver: &str) -> String {
-    let v = remote_ver.trim().trim_start_matches('v').trim();
-    let mut parts = vec![];
-    for ch in v.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            parts.push(ch);
-        } else {
-            break;
+/// macOS：清理旧版「运行时下载」模式遗留在 app_data_dir 的 admAgent 二进制（约 50MB+）。
+/// 新版直接使用安装包内置的 sidecar，旧文件永久闲置，启动时静默删除（失败不报错不阻塞）。
+#[cfg(target_os = "macos")]
+pub fn cleanup_legacy_adm_agent(app: &tauri::AppHandle) {
+    if let Ok(data_dir) = config::get_data_dir(Some(app)) {
+        let legacy = data_dir.join("admAgent");
+        if legacy.is_file() {
+            match std::fs::remove_file(&legacy) {
+                Ok(_) => eprintln!("[admAgent] 已清理旧版下载的二进制: {}", legacy.display()),
+                Err(e) => eprintln!("[admAgent] 清理旧版二进制失败（忽略）: {}", e),
+            }
         }
-    }
-    let raw: String = parts.iter().collect();
-    // 保证至少 x.y.z 三段；不足则补 .0
-    let mut segs: Vec<&str> = raw.split('.').collect();
-    while segs.len() < 3 {
-        segs.push("0");
-    }
-    segs.truncate(3);
-    // 过滤空段
-    let filtered: Vec<&str> = segs.into_iter().filter(|s| !s.is_empty()).collect();
-    if filtered.is_empty() {
-        "0.0.0".to_string()
-    } else {
-        filtered.join(".")
-    }
-}
-
-/// admAgent 下载地址（根据平台 + 远程版本动态构造）
-/// - Windows：admAgent_{version}_Windows_x86_64.zip
-/// - macOS(arm64)：admAgent_{version}_Darwin_arm64.tar.gz
-/// - Linux：返回错误（当前未提供 Linux 版本）
-fn adm_agent_download_url(remote_ver: &str) -> Result<String, AppError> {
-    let ver = extract_major_version(remote_ver);
-    #[cfg(target_os = "windows")]
-    {
-        Ok(format!("https://adm.tuduoduo.top/agent/admAgent_{}_Windows_x86_64.zip", ver))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(format!("https://adm.tuduoduo.top/agent/admAgent_{}_Darwin_arm64.tar.gz", ver))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        bail!("当前未提供 Linux 版本的 admAgent，敬请期待")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        bail!("不支持的操作系统，当前仅支持 Windows / macOS (ARM)")
-    }
-}
-
-/// 压缩包文件名
-fn adm_agent_archive_name(remote_ver: &str) -> Result<String, AppError> {
-    let ver = extract_major_version(remote_ver);
-    #[cfg(target_os = "windows")]
-    {
-        Ok(format!("admAgent_{}_Windows_x86_64.zip", ver))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(format!("admAgent_{}_Darwin_arm64.tar.gz", ver))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        bail!("当前未提供 Linux 版本的 admAgent，敬请期待")
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        bail!("不支持的操作系统，当前仅支持 Windows / macOS (ARM)")
     }
 }
 
@@ -429,7 +366,7 @@ fn slugify_model_id(name: &str) -> String {
 /// 前端提交的新增云端模型参数
 #[derive(Deserialize)]
 pub struct CloudProviderInput {
-    /// 模型名称（同时作为 provider 的展示名与 model 的 name）
+    /// 模型名称（同时作为 provider 的展示名与 model 的 name，原样写入、区分大小写）
     pub name: String,
     /// API base_url，例如 https://api.xiaomimimo.com/v1
     pub base_url: String,
@@ -437,12 +374,27 @@ pub struct CloudProviderInput {
     pub api_key: String,
     /// 上下文大小（tokens）。例如 256000（即 256K）
     pub context_window: u32,
-    /// 用户指定的模型ID（可选）。为空时自动从 name 派生
+    /// 用户填写的模型ID（必填，仅去首尾空白后原样写入、区分大小写）
     #[serde(default)]
     pub model_id: Option<String>,
     /// 是否支持图片输入（视觉模型），默认 false
     #[serde(default)]
     pub supports_images: bool,
+    /// 是否开启思考模式（thinking mode）。为 true 时写入
+    /// models[0].can_reason / reasoning_levels / default_reasoning_effort，
+    /// 服务端会发送 reasoning_effort 并强制遵守 reasoning_content 回传规则；默认 false
+    #[serde(default)]
+    pub can_reason: bool,
+}
+
+/// 提取用户填写的模型ID：仅去首尾空白，不做任何大小写/字符转换（严格按用户填写写入）。
+/// 为空时报错，不再静默从名称派生小写 id（历史派生逻辑曾把 MiniMax 等厂商的
+/// 大小写敏感模型ID小写化，导致请求 400）。
+fn require_model_id(model_id: &Option<String>) -> Result<String, AppError> {
+    match model_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Ok(s.to_string()),
+        None => bail!("模型ID不能为空"),
+    }
 }
 
 /// 新增一个云端模型 Provider 到 admAgent.json 的 `providers` 分支下。
@@ -451,7 +403,8 @@ pub struct CloudProviderInput {
 ///   这样后续 admAgent 启动/改上下文时 `ensure_adm_agent_config` 走「原地更新」分支，
 ///   不会重写默认结构从而覆盖掉本次新增的云端 provider。
 /// - 文件已存在则解析并尽量保留其它字段；不存在则用完整默认结构。
-/// - 以模型名称派生 provider key 与 model id，插入（或覆盖同名）`providers[key]`。
+/// - 以模型名称派生 provider key；模型ID与名称严格按用户填写写入（区分大小写），
+///   插入（或覆盖同名）`providers[key]`。
 /// - 写入采用原子方式（临时文件 + rename）。
 ///
 /// 返回新增的 provider key，供前端提示。
@@ -479,11 +432,21 @@ pub async fn add_cloud_provider(
         config["providers"] = serde_json::json!({});
     }
 
-    // 3) 派生 key / model id 并构造 provider
+    // 3) 派生 provider key（仅作 JSON 内部键）；模型ID/名称原样写入，区分大小写
     let key = slugify_provider_key(&input.name);
-    let model_id = input.model_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| slugify_model_id(&input.name));
+    let model_id = require_model_id(&input.model_id)?;
+
+    // 开启思考模式时补充推理档位元数据，服务端 effectiveReasoningEffort
+    // 才能解析出具体档位（与内置远程池模型保持一致）
+    let (can_reason, reasoning_levels, default_reasoning_effort) = if input.can_reason {
+        (
+            serde_json::json!(true),
+            serde_json::json!(["low", "medium", "high"]),
+            serde_json::json!("medium"),
+        )
+    } else {
+        (serde_json::json!(false), serde_json::Value::Null, serde_json::Value::Null)
+    };
 
     let provider = serde_json::json!({
         "name": input.name,
@@ -495,7 +458,10 @@ pub async fn add_cloud_provider(
                 "id": model_id,
                 "name": input.name,
                 "context_window": input.context_window,
-                "supports_images": input.supports_images
+                "supports_images": input.supports_images,
+                "can_reason": can_reason,
+                "reasoning_levels": reasoning_levels,
+                "default_reasoning_effort": default_reasoning_effort
             }
         ]
     });
@@ -520,6 +486,8 @@ pub struct CloudProviderView {
     pub model_id: String,
     /// models[0].supports_images，是否支持图片输入
     pub supports_images: bool,
+    /// models[0].can_reason，是否开启思考模式
+    pub can_reason: bool,
 }
 
 /// 列出 admAgent.json 中已添加的全部云端模型 Provider（排除自动管理的 `local`）。
@@ -579,6 +547,12 @@ pub async fn list_cloud_providers(
                 .and_then(|m0| m0.get("supports_images"))
                 .and_then(|s| s.as_bool())
                 .unwrap_or(false);
+            let can_reason = prov
+                .get("models")
+                .and_then(|m| m.get(0))
+                .and_then(|m0| m0.get("can_reason"))
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
             out.push(CloudProviderView {
                 key: key.clone(),
                 name,
@@ -587,6 +561,7 @@ pub async fn list_cloud_providers(
                 context_window,
                 model_id,
                 supports_images,
+                can_reason,
             });
         }
     }
@@ -626,7 +601,7 @@ pub async fn delete_cloud_provider(
 }
 
 /// 更新指定 key 的云端模型 Provider（按 key 定位，替换其全部参数）。
-/// 模型名称变更时同步重派生 model id；保留同一 key 以免产生孤儿条目。
+/// 模型ID与名称严格按用户填写写入（区分大小写）；保留同一 key 以免产生孤儿条目。
 #[tauri::command]
 pub async fn update_cloud_provider(
     _app: tauri::AppHandle,
@@ -652,9 +627,18 @@ pub async fn update_cloud_provider(
         bail!("未找到 provider: {}", key);
     }
 
-    let model_id = input.model_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| slugify_model_id(&input.name));
+    let model_id = require_model_id(&input.model_id)?;
+    // 开启思考模式时补充推理档位元数据，服务端 effectiveReasoningEffort
+    // 才能解析出具体档位（与内置远程池模型保持一致）
+    let (can_reason, reasoning_levels, default_reasoning_effort) = if input.can_reason {
+        (
+            serde_json::json!(true),
+            serde_json::json!(["low", "medium", "high"]),
+            serde_json::json!("medium"),
+        )
+    } else {
+        (serde_json::json!(false), serde_json::Value::Null, serde_json::Value::Null)
+    };
     let new_provider = serde_json::json!({
         "name": input.name,
         "base_url": input.base_url,
@@ -665,7 +649,10 @@ pub async fn update_cloud_provider(
                 "id": model_id,
                 "name": input.name,
                 "context_window": input.context_window,
-                "supports_images": input.supports_images
+                "supports_images": input.supports_images,
+                "can_reason": can_reason,
+                "reasoning_levels": reasoning_levels,
+                "default_reasoning_effort": default_reasoning_effort
             }
         ]
     });
@@ -704,191 +691,7 @@ pub async fn check_adm_agent(app: tauri::AppHandle) -> Result<AdmAgentInfo, AppE
     })
 }
 
-/// 下载 admAgent 工具（远程包含 admAgentVersion 字段，自动构造压缩包 URL 下载并解压）。
-/// 会先拉取 update.json 获取远程版本号，再根据平台构造 URL；下载后解压覆盖本地 admAgent。
-#[tauri::command]
-pub async fn download_adm_agent(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), AppError> {
-    // 与 server 启动/停止串行化，避免下载覆盖二进制时并发拉起新进程。
-    let _start_guard = state.agent_start_lock.lock().await;
-
-    // 1. 获取远程版本
-    let remote_ver = fetch_update_info()
-        .await?
-        .adm_agent_version
-        .ok_or_else(|| "远程配置缺少 admAgentVersion 字段".to_string())?;
-
-    let url = adm_agent_download_url(&remote_ver)?;
-    let archive_name = adm_agent_archive_name(&remote_ver)?;
-    let dir = adm_agent_target_dir(&app)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
-
-    // 2. 下载前先停掉正在运行的 admAgent server，释放 Windows 上的文件锁
-    stop_agent_server_internal(&state).ok();
-
-    let archive_path = dir.join(&archive_name);
-    app.emit(
-        "agent-download-progress",
-        serde_json::json!({ "status": "downloading", "progress": 0 }),
-    )
-    .ok();
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("下载请求失败: {}", e))?;
-
-    if !response.status().is_success() {
-        bail!("下载失败，HTTP 状态码: {}", response.status());
-    }
-
-    let total_size: u64 = response.content_length().unwrap_or(0);
-
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(&archive_path)
-        .await
-        .map_err(|e| format!("创建压缩包文件失败: {}", e))?;
-
-    let mut downloaded: u64 = 0;
-    let mut stream = response.bytes_stream();
-    use futures_util::StreamExt;
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("下载数据读取失败: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        let progress = if total_size > 0 {
-            ((downloaded as f64 / total_size as f64) * 100.0).min(99.0) as u8
-        } else {
-            0
-        };
-
-        app.emit(
-            "agent-download-progress",
-            serde_json::json!({ "status": "downloading", "progress": progress }),
-        )
-        .ok();
-    }
-
-    file.flush().await.map_err(|e| format!("刷新文件失败: {}", e))?;
-    drop(file);
-
-    // 3. 解压覆盖本地 admAgent 文件
-    app.emit(
-        "agent-download-progress",
-        serde_json::json!({ "status": "extracting", "progress": 0 }),
-    )
-    .ok();
-
-    // 先尝试删除旧文件（进程刚结束可能仍有极短占用，故带重试）
-    let dest = adm_agent_path(&app)?;
-    if dest.exists() {
-        let mut removed = false;
-        for _ in 0..15 {
-            if std::fs::remove_file(&dest).is_ok() {
-                removed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if !removed {
-            // 尝试清理压缩包后报错
-            let _ = std::fs::remove_file(&archive_path);
-            bail!("替换 admAgent 失败：旧文件仍被占用，请手动关闭 Agent 终端后重试");
-        }
-    }
-
-    // 根据后缀判断压缩包格式并解压
-    let ext = archive_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let is_zip = archive_name.ends_with(".zip");
-
-    let copied = if is_zip || ext == "zip" {
-        crate::common::utils::archive::extract_zip(&archive_path, &dir)?
-    } else {
-        crate::common::utils::archive::extract_tar_gz(&archive_path, &dir)?
-    };
-
-    if copied == 0 {
-        let _ = std::fs::remove_file(&archive_path);
-        bail!("解压后未找到任何文件，请检查压缩包是否完整");
-    }
-
-    // 解压出来的文件名可能与预期不同（如与 admAgent_file_name() 不一致），需要定位并移动到正确路径
-    if !dest.exists() {
-        // 在目录中搜索 admAgent 可执行文件
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        // 匹配 admAgent 或 admAgent.exe（Windows 中带 .exe 但压缩包可能不带）
-                        let is_target = if cfg!(target_os = "windows") {
-                            name.eq_ignore_ascii_case(adm_agent_file_name())
-                                || name.eq_ignore_ascii_case("admAgent")
-                                || name.eq_ignore_ascii_case("admAgent.exe")
-                        } else {
-                            name == "admAgent" || name == adm_agent_file_name()
-                        };
-                        if is_target {
-                            if p != dest {
-                                let _ = std::fs::rename(&p, &dest);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. 删除下载的压缩包
-    let _ = std::fs::remove_file(&archive_path);
-
-    // 5. macOS 需要赋予可执行权限
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if dest.exists() {
-            let mut perms = std::fs::metadata(&dest)
-                .map_err(|e| format!("读取权限失败: {}", e))?
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dest, perms).map_err(|e| format!("设置执行权限失败: {}", e))?;
-        }
-    }
-
-    app.emit(
-        "agent-download-progress",
-        serde_json::json!({ "status": "done", "progress": 100 }),
-    )
-    .ok();
-
-    Ok(())
-}
-
-// ===== admAgent 版本检查与更新（接入主升级流程） =====
-
-/// 归一化 admAgent 版本号：去掉首尾空白与开头的 'v' 前缀。
-/// 例如 "v0.0.1-250db9" -> "0.0.1-250db9"。
-/// 注意：admAgent 版本含 commit 短哈希后缀，不能按 semver 数值比较，
-/// 故采用归一化后的字符串相等性判断。
-fn normalize_agent_version(v: &str) -> String {
-    v.trim().trim_start_matches('v').to_string()
-}
+// ===== admAgent 版本读取 =====
 
 /// 解析 `admAgent -v` 输出，提取版本号。
 /// 输出示例：`admAgent version v0.0.1-250db9`
@@ -937,255 +740,10 @@ pub async fn get_adm_agent_version(app: tauri::AppHandle) -> Result<Option<Strin
     get_adm_agent_local_version(&app)
 }
 
-/// 下载并替换 admAgent 工具（版本更新用）。
-/// 使用服务端下发的下载地址（压缩包），下载到 admAgent 默认存放路径解压并覆盖旧版本。
-#[tauri::command]
-pub async fn download_adm_agent_update(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    url: String,
-) -> Result<(), AppError> {
-    // 与 server 启动/停止串行化，避免升级替换二进制时并发拉起新进程。
-    let _start_guard = state.agent_start_lock.lock().await;
-
-    if url.trim().is_empty() || !url.starts_with("http") {
-        bail!(
-            "下载地址无效: {}，请重新检查更新",
-            if url.is_empty() { "地址为空" } else { &url }
-        );
-    }
-
-    let dir = adm_agent_target_dir(&app)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {}", e))?;
-
-    // 从 URL 中提取文件名作为压缩包名
-    let archive_name = url.split('/').next_back().unwrap_or("admAgent_archive").to_string();
-    let archive_path = dir.join(&archive_name);
-
-    app.emit(
-        "adm-agent-update-progress",
-        serde_json::json!({ "status": "downloading", "progress": 0 }),
-    )
-    .ok();
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-
-    let response = client.get(&url).send().await.map_err(|e| {
-        let detail = if e.is_connect() {
-            format!("无法连接到服务器（{}），请检查网络连接", url)
-        } else if e.is_timeout() {
-            "连接超时，请检查网络或更换网络环境".to_string()
-        } else {
-            format!("{}", e)
-        };
-        format!("下载请求失败: {}", detail)
-    })?;
-
-    if !response.status().is_success() {
-        bail!("下载失败，HTTP 状态码: {}", response.status());
-    }
-
-    let total_size: u64 = response.content_length().unwrap_or(0);
-
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(&archive_path)
-        .await
-        .map_err(|e| format!("创建压缩包文件失败: {}", e))?;
-
-    let mut downloaded: u64 = 0;
-    let mut stream = response.bytes_stream();
-    use futures_util::StreamExt;
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("下载数据读取失败: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        let progress = if total_size > 0 {
-            ((downloaded as f64 / total_size as f64) * 100.0).min(99.0) as u8
-        } else {
-            0
-        };
-        app.emit(
-            "adm-agent-update-progress",
-            serde_json::json!({ "status": "downloading", "progress": progress }),
-        )
-        .ok();
-    }
-    file.flush().await.map_err(|e| format!("刷新文件失败: {}", e))?;
-    drop(file);
-
-    app.emit(
-        "adm-agent-update-progress",
-        serde_json::json!({ "status": "extracting", "progress": 0 }),
-    )
-    .ok();
-
-    // 解压前先停掉正在运行的 admAgent server，释放被 Windows 锁定的 admAgent.exe。
-    stop_agent_server_internal(&state).ok();
-
-    // 先尝试删除旧文件（进程刚结束可能仍有极短占用，故带重试）
-    let dest = adm_agent_path(&app)?;
-    if dest.exists() {
-        let mut removed = false;
-        for _ in 0..15 {
-            if std::fs::remove_file(&dest).is_ok() {
-                removed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if !removed {
-            let _ = std::fs::remove_file(&archive_path);
-            bail!("替换 admAgent 失败：旧文件仍被占用，请手动关闭 Agent 终端后重试");
-        }
-    }
-
-    // 根据文件名后缀判断压缩包格式并解压
-    let is_zip = archive_name.ends_with(".zip");
-    let copied = if is_zip {
-        crate::common::utils::archive::extract_zip(&archive_path, &dir)?
-    } else {
-        crate::common::utils::archive::extract_tar_gz(&archive_path, &dir)?
-    };
-
-    if copied == 0 {
-        let _ = std::fs::remove_file(&archive_path);
-        bail!("解压后未找到任何文件，请检查压缩包是否完整");
-    }
-
-    // 解压出来的文件名可能与预期不同（如与 admAgent_file_name() 不一致），需要定位并移动到正确路径
-    if !dest.exists() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        let is_target = if cfg!(target_os = "windows") {
-                            name.eq_ignore_ascii_case(adm_agent_file_name())
-                                || name.eq_ignore_ascii_case("admAgent")
-                                || name.eq_ignore_ascii_case("admAgent.exe")
-                        } else {
-                            name == "admAgent" || name == adm_agent_file_name()
-                        };
-                        if is_target {
-                            if p != dest {
-                                let _ = std::fs::rename(&p, &dest);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 删除下载的压缩包
-    let _ = std::fs::remove_file(&archive_path);
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if dest.exists() {
-            let mut perms = std::fs::metadata(&dest)
-                .map_err(|e| format!("读取权限失败: {}", e))?
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dest, perms).map_err(|e| format!("设置执行权限失败: {}", e))?;
-        }
-    }
-
-    app.emit(
-        "adm-agent-update-progress",
-        serde_json::json!({ "status": "done", "progress": 100 }),
-    )
-    .ok();
-
-    Ok(())
-}
-
 /// 获取当前系统架构（主要用于 macOS Intel/ARM 区分）
 #[tauri::command]
 pub fn get_platform_arch() -> String {
     std::env::consts::ARCH.to_string()
-}
-
-/// 检查 admAgent 是否需要更新（仅在点击底部栏 Agent 按钮时调用，不在启动时检查）。
-/// 支持 Windows 和 macOS (arm64) 平台，根据远程 admAgentVersion 动态构造下载地址。
-#[tauri::command]
-pub async fn check_adm_agent_update(app: tauri::AppHandle) -> Result<AdmAgentUpdateCheck, AppError> {
-    let mut needs_update = false;
-    let mut local_version: Option<String> = None;
-    let mut remote_version: Option<String> = None;
-    let mut download_url: Option<String> = None;
-
-    // 拉取远程更新清单（失败时不强制更新，仅返回本地版本）
-    let update_info = match fetch_update_info().await {
-        Ok(info) => info,
-        Err(_) => {
-            local_version = get_adm_agent_local_version(&app).ok().flatten();
-            return Ok(AdmAgentUpdateCheck {
-                needs_update,
-                remote_version,
-                local_version,
-                download_url,
-            });
-        }
-    };
-    remote_version = update_info.adm_agent_version.clone();
-
-    // 根据平台 + 远程版本构造下载地址（Linux 不返回 URL，前端据此提示暂未开放）
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(ref remote_ver) = remote_version {
-            download_url = adm_agent_download_url(remote_ver).ok();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(ref remote_ver) = remote_version {
-            download_url = adm_agent_download_url(remote_ver).ok();
-        }
-    }
-    // Linux: download_url 保持 None，前端据此判断为暂不支持
-
-    if let Some(ref remote_ver) = remote_version {
-        // 仅在能拿到下载地址（Windows / macOS arm64）时才判定需要更新
-        if download_url.is_some() {
-            match get_adm_agent_local_version(&app) {
-                Ok(local_opt) => {
-                    local_version = local_opt.clone();
-                    match local_opt {
-                        None => {
-                            // 本地未安装，需要下载（首次安装由 goAgent 的 check_adm_agent 流程处理）
-                            needs_update = true;
-                        }
-                        Some(local) => {
-                            if normalize_agent_version(&local) != normalize_agent_version(remote_ver) {
-                                needs_update = true;
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // 无法运行/解析，标记 unknown 但不强制下载
-                    local_version = Some("unknown".to_string());
-                }
-            }
-        }
-    }
-
-    Ok(AdmAgentUpdateCheck {
-        needs_update,
-        remote_version,
-        local_version,
-        download_url,
-    })
 }
 
 /// 获取已配置的 agent 工作目录（默认为空字符串）
@@ -1301,8 +859,20 @@ pub async fn start_agent_server(
     cmd.kill_on_drop(true);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    if let Some(parent) = agent_path.parent() {
-        cmd.current_dir(parent);
+    // 子进程工作目录：Windows 用二进制所在目录（exe 根目录，可写）；
+    // macOS 二进制在只读性质的 ADM.app/Contents/MacOS 内，改用 app_data_dir，
+    // 避免任何潜在的「在 bundle 内写文件」行为（配置在 ~/.config/admAgent、工作区靠 --cwd，均不依赖 cwd）。
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(data_dir) = config::get_data_dir(Some(&app)) {
+            cmd.current_dir(data_dir);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(parent) = agent_path.parent() {
+            cmd.current_dir(parent);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -1485,10 +1055,12 @@ async fn forward_sse_events(
                 // 避免在死进程上无限空转、前端只能看到 "admAgent server 未运行"
                 if agent_process_exited(app) {
                     println!("[agent] forward_sse_events: admAgent 进程已退出，通知前端自动重启");
+                    api_debug_log(|| "SSE ! admAgent 进程已退出，通知前端自动重启".to_string());
                     let _ = app.emit("agent-server-died", serde_json::json!({}));
                     return Ok(());
                 }
                 println!("[agent] forward_sse_events 连接失败: {}", e);
+                api_debug_log(|| format!("SSE ! 连接失败: {}", e));
                 tokio::time::sleep(Duration::from_secs(3)).await; continue;
             }
         };
@@ -1497,6 +1069,7 @@ async fn forward_sse_events(
             tokio::time::sleep(Duration::from_secs(3)).await; continue;
         }
         println!("[agent] forward_sse_events SSE 已连接 workspace: {}", workspace_id);
+        api_debug_log(|| format!("SSE = 已连接 workspace={} client={}", workspace_id, client_id));
 
         use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
@@ -1518,6 +1091,8 @@ async fn forward_sse_events(
                 if !event_data.is_empty() {
                     let payload: serde_json::Value = serde_json::from_str(&event_data)
                         .unwrap_or(serde_json::json!({ "raw": event_data }));
+                    // 只写关键事件；流式增量/快照等噪音返回 None 不落盘。
+                    api_debug_log(|| summarize_sse_event(&payload).unwrap_or_default());
                     let _ = app.emit("agent-sse-event", serde_json::json!({ "type": event_type, "data": payload }));
                 }
             }
@@ -1526,6 +1101,7 @@ async fn forward_sse_events(
         // 任何等待都在扩大 server 自杀的竞争窗口
         if !stop.load(Ordering::Relaxed) {
             println!("[agent] forward_sse_events 流断开，立即重连");
+            api_debug_log(|| "SSE ! 流断开，立即重连".to_string());
         }
     }
 }
@@ -1538,6 +1114,150 @@ fn agent_process_exited(app: &tauri::AppHandle) -> bool {
     match s.as_mut() {
         Some(sess) => matches!(sess.child.try_wait(), Ok(Some(_))),
         None => false,
+    }
+}
+
+// ===== 调试模式：admAgent API 交互日志（运行时开关，正式发布版也可用）=====
+//
+// 由设置里的“调试模式”开关控制（Settings.debug_logging，持久化到
+// config.json）：启动时恢复、前端实时切换。关闭时 log_enabled 为 false，
+// api_debug_log 一次 atomic load 即返回，无任何开销也不产生文件。
+
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+// 日志文件句柄：None = 尚未打开 / 打开失败。开关打开时截断重建，
+// 为“每次重启软件自动清空上次日志”：重启后首次 enable 时 File::create 截断。
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> = std::sync::OnceLock::new();
+
+fn log_file_cell() -> &'static std::sync::Mutex<Option<std::fs::File>> {
+    LOG_FILE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 调试日志文件路径：app 数据目录（与 config.json 同处）下的 adm_api_debug.log。
+/// 不用 exe 同目录：正式安装下 Windows 的 Program Files 不可写、macOS 会污染
+/// .app 签名；app 数据目录始终可写且不影响安装包完整性。
+fn api_debug_log_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = config::get_data_dir(Some(app)).ok()?;
+    Some(dir.join("adm_api_debug.log"))
+}
+
+/// 开启调试日志：首次开启（含重启后）截断重建日志文件（清空上次），
+/// 已处于开启态时幂等返回（不重复截断）——否则调试期间每次保存设置
+/// 都会把本会话已积累的日志清空（排查中断时往往会顺手改模型/参数）。
+/// 返回日志文件路径供前端展示。
+fn enable_api_debug_log(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let path = api_debug_log_path(app)?;
+    if LOG_ENABLED.load(Ordering::Relaxed) {
+        return Some(path); // 已开启：保持追加，不重复截断
+    }
+    let file = std::fs::File::create(&path).ok()?; // 截断：从关到开 / 重启后首次全新
+    if let Ok(mut cell) = log_file_cell().lock() {
+        *cell = Some(file);
+    }
+    LOG_ENABLED.store(true, Ordering::Relaxed);
+    println!("[agent] 调试日志已开启: {}", path.display());
+    Some(path)
+}
+
+/// 关闭调试日志：置位关关、释放句柄并删除日志文件，避免过期日志残留
+/// （否则“打开日志目录”会定位到一份不再更新的旧日志，容易误读）。
+fn disable_api_debug_log(app: &tauri::AppHandle) {
+    LOG_ENABLED.store(false, Ordering::Relaxed);
+    if let Ok(mut cell) = log_file_cell().lock() {
+        *cell = None;
+    }
+    if let Some(path) = api_debug_log_path(app) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// 单行日志内容去换行 + 截断。
+fn api_log_snippet(s: &str, max: usize) -> String {
+    let flat = s.replace('\n', " ↵ ");
+    flat.chars().take(max).collect()
+}
+
+/// 写一条 admAgent API 交互日志。开关关闭时一次 atomic load 即返回（闭包
+/// 不执行，无格式化开销）。与 devtools 控制台的 [agent] API / SSE 日志对应：
+/// 所有前端请求都经 agent_http_request 代理、所有 SSE 事件都经
+/// forward_sse_events 转发，在这两处落盘即可完整复盘对话中断问题。
+/// 行格式：`{epoch_ms} {HH:MM:SS.mmm UTC} {内容}`，与 admAgent.log 对时时
+/// 本地时间 = UTC + 本机时区偏移。
+fn api_debug_log<F: FnOnce() -> String>(line: F) {
+    if !LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut cell) = log_file_cell().lock() {
+        if let Some(f) = cell.as_mut() {
+            let content = line();
+            // 空内容（如 summarize_sse_event 对噪音事件返回 None）不写，
+            // 避免产生只有时间戳的空行。
+            if content.is_empty() { return; }
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let secs = ms / 1000;
+            let _ = writeln!(
+                f, "{} {:02}:{:02}:{:02}.{:03}Z {}",
+                ms, (secs / 3600) % 24, (secs / 60) % 60, secs % 60, ms % 1000,
+                content
+            );
+        }
+    }
+}
+
+/// 把一条 SSE 事件精简为一行可排查摘要；返回 None 表示这类事件是噪音
+/// （流式 message updated 增量、session token 快照等），不写日志。
+/// 只保留能定位“对话为何中断/卡住”的关键节点：运行收尾、错误、权限、
+/// 消息创建节奏、连接生命周期。SSE data 结构：
+/// `{ type: <事件类型>, payload: { type: created|updated|deleted, payload: {..} } }`。
+fn summarize_sse_event(payload: &serde_json::Value) -> Option<String> {
+    let ev = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let inner = payload.pointer("/payload/type").and_then(|v| v.as_str()).unwrap_or("");
+    let data = payload.pointer("/payload/payload");
+    // 取 data 下的字符串字段（数字/布尔转成字面量），缺失返回空串。
+    let field = |k: &str| -> String {
+        match data.and_then(|d| d.get(k)) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        }
+    };
+    match ev {
+        // 运行收尾：最关键的一条。error 非空 = 服务端报错中断；
+        // cancelled = 被取消；两者皆空 = 正常收尾（叙述性 stop / 完成）。
+        "run_complete" => {
+            let err = field("error");
+            let has_err = !err.is_empty() && err != "null";
+            let flag = if has_err { "! run_complete" } else { "< run_complete" };
+            Some(format!(
+                "{} run_id={} session={} error={} cancelled={} msg_id={}",
+                flag, field("run_id"), field("session_id"), err, field("cancelled"), field("message_id")
+            ))
+        }
+        // Agent 事件：错误 / 摘要（summarize）。
+        "agent_event" => {
+            let err = field("error");
+            let has_err = !err.is_empty() && err != "null";
+            let flag = if has_err { "! agent_event" } else { "< agent_event" };
+            Some(format!("{} type={} session={} error={}", flag, field("type"), field("session_id"), err))
+        }
+        // 消息节奏：只记 created（新建 user/assistant/tool 消息），跳过 updated
+        // 的流式增量（一轮上百条 thinking 是主噪音）。能看出“这轮到底产出了
+        // 哪些消息”——全程只一条 assistant 无 tool = 叙述性 stop。
+        "message" => {
+            if inner != "created" { return None; }
+            Some(format!("< message created role={} id={}", field("role"), field("id")))
+        }
+        // 权限请求 / 结果：Plan/Yolo 下一般直通，出现即值得记。
+        "permission_request" => Some(format!("< permission_request tool={} session={}", field("tool_name"), field("session_id"))),
+        "permission_notification" => Some(format!("< permission_notification granted={}", field("granted"))),
+        // session 快照（context_tokens/is_busy 每次 token 变化都推）、file/lsp/
+        // mcp/skills 等杂项：噪音，跳过。解析失败的原始事件仍记一行以便发现异常。
+        "session" => None,
+        "" if payload.get("raw").is_some() => Some(format!("< raw {}", api_log_snippet(&payload.get("raw").and_then(|v| v.as_str()).unwrap_or(""), 200))),
+        _ => None,
     }
 }
 
@@ -1575,6 +1295,17 @@ pub async fn agent_http_request(
         }
     };
     let url = format!("http://127.0.0.1:{}{}", port, path);
+    let started = std::time::Instant::now();
+    // 只读 GET 多为高频轮询（每轮 run 后刷 /agent /sessions /messages），是主噪音：
+    // 成功时不记，只在出错时留痕；改状态的操作（发消息/切模式/权限）才记请求行。
+    let is_get = method.eq_ignore_ascii_case("GET");
+    if !is_get {
+        api_debug_log(|| format!(
+            "HTTP > {} {}{}",
+            method.to_uppercase(), path,
+            body.as_ref().map(|b| format!(" body={}", api_log_snippet(&b.to_string(), 800))).unwrap_or_default()
+        ));
+    }
     let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
     let req = match method.to_uppercase().as_str() {
@@ -1583,24 +1314,33 @@ pub async fn agent_http_request(
         "PATCH" => client.patch(&url), _ => bail!("不支持的 HTTP 方法: {}", method),
     };
     let req = if let Some(b) = body { req.json(&b) } else { req };
-    let resp = req.send().await.map_err(|e| format!("HTTP 请求失败: {}", e))?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // 网络失败一律留痕（含 GET）：连不上 server 是中断的关键线索。
+            api_debug_log(|| format!("HTTP ! {} {} 请求失败({}ms): {}", method.to_uppercase(), path, started.elapsed().as_millis(), e));
+            bail!("HTTP 请求失败: {}", e);
+        }
+    };
     let status = resp.status();
 
     // 无响应体的状态码直接返回空 JSON 对象
     // 202 Accepted: /agent 发送消息（fire-and-forget）
     // 204 No Content: 删除等操作
     if status.as_u16() == 202 || status.as_u16() == 204 {
+        api_debug_log(|| format!("HTTP < {} {} {} ({}ms)", status.as_u16(), method.to_uppercase(), path, started.elapsed().as_millis()));
         return Ok(serde_json::json!({}));
     }
 
     // 对于 200 OK，尝试解析 JSON；如果解析失败（空 body），返回空对象
     // 这适用于 /agent/update 等成功但无 body 的接口
     if status.as_u16() == 200 {
-        // 先尝试解析 JSON
-        match resp.json::<serde_json::Value>().await {
-            Ok(result) => return Ok(result),
-            Err(_) => return Ok(serde_json::json!({})), // 空 body 返回 {}
+        // 成功响应不 dump body（GET /messages 等会打一大坡）；只记非 GET 的一行状态+耗时。
+        let result = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::json!({}));
+        if !is_get {
+            api_debug_log(|| format!("HTTP < 200 {} {} ({}ms)", method.to_uppercase(), path, started.elapsed().as_millis()));
         }
+        return Ok(result);
     }
 
     // 其它状态码（4xx/5xx）：读取响应体作为错误抛出。
@@ -1608,7 +1348,59 @@ pub async fn agent_http_request(
     // 空列表/空聊天（表现为“列表加载不出来”且控制台无任何报错）
     let text = resp.text().await.unwrap_or_default();
     let snippet: String = text.chars().take(300).collect();
+    api_debug_log(|| format!(
+        "HTTP ! {} {} {} ({}ms) err={}",
+        status.as_u16(), method.to_uppercase(), path, started.elapsed().as_millis(),
+        api_log_snippet(&snippet, 300)
+    ));
     bail!("HTTP {} {} {}: {}", status.as_u16(), method.to_uppercase(), path, snippet);
+}
+
+/// 读取 workspace 的跨会话项目记忆（project_memory.json）。
+/// admAgent 每次上下文压缩时会把 durable 的 constraint/decision anchors 同步进
+/// `{workspace data_dir}/project_memory.json`（与 rail3.db 同级）。本命令先从
+/// admAgent 取 workspace 的 data_dir，再读取该文件，仅用于前端只读展示。
+/// 文件不存在或为空返回空数组。
+#[tauri::command]
+pub async fn read_project_memory(
+    state: tauri::State<'_, AppState>,
+    workspace_id: String,
+) -> Result<serde_json::Value, AppError> {
+    let port = {
+        let mut s = state.agent_session.lock().map_err(|e| e.to_string())?;
+        match s.as_mut() {
+            Some(sess) => {
+                let running = sess.child.try_wait().ok().flatten().is_none();
+                if running { sess.port } else { bail!("admAgent server 未运行"); }
+            }
+            None => bail!("admAgent server 未运行"),
+        }
+    };
+
+    // GET /v1/workspaces/{id} → { id, path, data_dir, ... }
+    let url = format!("http://127.0.0.1:{}/v1/workspaces/{}", port, workspace_id);
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("HTTP 请求失败: {}", e))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} 获取 workspace 信息失败", resp.status().as_u16());
+    }
+    let ws: serde_json::Value = resp.json().await
+        .map_err(|e| format!("解析 workspace 响应失败: {}", e))?;
+    let data_dir = ws.get("data_dir").and_then(|v| v.as_str()).unwrap_or("");
+    if data_dir.is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+
+    let path = std::path::Path::new(data_dir).join("project_memory.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            // 文件存在但内容非法/为空时按空处理，绝不让展示层报错
+            Ok(serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!([])))
+        }
+        Err(_) => Ok(serde_json::json!([])),
+    }
 }
 
 #[tauri::command]
@@ -1679,18 +1471,33 @@ pub fn kill_agent_session(state: &AppState) {
 
 // ===== 日志管理 =====
 
-/// 获取 admAgent 日志文件路径（agent_dir/.admAgent/logs/admAgent.log）
-/// agent_dir 是 admAgent.exe 所在的目录，admAgent 使用该目录作为数据目录
-fn get_adm_agent_log_path(agent_dir: &std::path::Path) -> PathBuf {
-    agent_dir.join(".admAgent").join("logs").join("admAgent.log")
+/// 获取 admAgent 日志文件路径（<数据目录>/.admAgent/logs/admAgent.log）。
+/// admAgent 的 DataDirectory 默认 ".admAgent" 按进程 cwd 解析，故日志落在进程 cwd 下：
+/// - macOS：start_agent_server 把进程 cwd 设为 app_data_dir（避免写入只读的 App bundle）
+/// - 其它平台：进程 cwd = admAgent 二进制所在目录
+fn get_adm_agent_log_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(config::get_data_dir(Some(app))?
+            .join(".admAgent")
+            .join("logs")
+            .join("admAgent.log"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let agent_path = adm_agent_path(app)?;
+        let agent_dir = agent_path.parent().unwrap_or(std::path::Path::new("."));
+        Ok(agent_dir
+            .join(".admAgent")
+            .join("logs")
+            .join("admAgent.log"))
+    }
 }
 
 /// 读取 admAgent 日志文件内容（返回最后 N 行，默认 2000 行）
 #[tauri::command]
 pub async fn get_adm_agent_logs(app: tauri::AppHandle, tail: Option<usize>) -> Result<String, AppError> {
-    let agent_path = adm_agent_path(&app)?;
-    let agent_dir = agent_path.parent().unwrap_or(std::path::Path::new("."));
-    let log_path = get_adm_agent_log_path(agent_dir);
+    let log_path = get_adm_agent_log_path(&app)?;
     if !log_path.exists() {
         return Ok("（admAgent 日志文件不存在: {}）".to_string().replace("{}", &log_path.display().to_string()));
     }
@@ -1714,9 +1521,7 @@ pub async fn get_adm_agent_logs(app: tauri::AppHandle, tail: Option<usize>) -> R
 pub async fn export_agent_logs(app: tauri::AppHandle) -> Result<(), AppError> {
     use tauri_plugin_dialog::DialogExt;
 
-    let agent_path = adm_agent_path(&app)?;
-    let agent_dir = agent_path.parent().unwrap_or(std::path::Path::new("."));
-    let log_path = get_adm_agent_log_path(agent_dir);
+    let log_path = get_adm_agent_log_path(&app)?;
     if !log_path.exists() {
         bail!("admAgent 日志文件不存在: {}", log_path.display());
     }
@@ -1768,5 +1573,201 @@ pub async fn pick_workdir_folder(app: tauri::AppHandle) -> Result<String, AppErr
         .map_err(|e| format!("无法获取目录路径: {}", e))?;
 
     Ok(path.to_string_lossy().to_string())
+}
+
+/// 启动时根据持久化设置恢复调试日志开关（config.json 的 debug_logging）。
+/// 开启时截断重建日志文件 —— 实现“每次重启软件自动清空上次日志”。
+/// 在 setup 阶段调用，早于任何 admAgent 交互。
+pub fn init_debug_logging(app: &tauri::AppHandle) {
+    let data_dir = match config::get_data_dir(Some(app)) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let config_path = data_dir.join("config.json");
+    let enabled = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<Settings>(&json).ok())
+        .map(|s| s.debug_logging)
+        .unwrap_or(false);
+    if enabled {
+        enable_api_debug_log(app);
+    }
+}
+
+/// 设置调试日志开关（前端实时切换）。开启时首次截断重建日志文件（清空上次），
+/// 返回日志文件绝对路径；关闭时释放句柄并删除旧日志、返回空串。
+/// 运行时开关与编译 profile 无关，正式发布版同样生效。
+#[tauri::command]
+pub async fn set_debug_logging(app: tauri::AppHandle, enabled: bool) -> Result<String, AppError> {
+    if enabled {
+        match enable_api_debug_log(&app) {
+            Some(path) => Ok(path.to_string_lossy().to_string()),
+            None => bail!("无法创建调试日志文件"),
+        }
+    } else {
+        disable_api_debug_log(&app);
+        Ok(String::new())
+    }
+}
+
+/// 在系统文件管理器中打开调试日志所在位置（app 数据目录）。
+/// 日志文件已存在时定位并高亮该文件；尚未生成时（未开过调试）
+/// 打开其所在目录。
+#[tauri::command]
+pub async fn open_debug_log_dir(app: tauri::AppHandle) -> Result<(), AppError> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = api_debug_log_path(&app).ok_or("无法确定调试日志路径")?;
+    if path.exists() {
+        // 文件存在：在文件管理器中定位并高亮
+        app.opener()
+            .reveal_item_in_dir(&path)
+            .map_err(|e| format!("打开日志目录失败: {}", e))?;
+    } else {
+        // 文件不存在（未开过调试）：打开所在目录
+        let dir = path.parent().ok_or("无法确定日志目录")?;
+        app.opener()
+            .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+            .map_err(|e| format!("打开目录失败: {}", e))?;
+    }
+    Ok(())
+}
+
+/// 读取粘贴/拖入的文件内容，供前端作为附件发送（图片走浏览器剪贴板直读，
+/// 文本等文件剪贴板只带路径，需在此读取真实内容）。
+/// 返回文件名与 base64 编码内容；MIME 由前端按扩展名推断（与选择器逻辑一致）。
+#[tauri::command]
+pub async fn read_attachment_file(path: String) -> Result<serde_json::Value, AppError> {
+    use base64::Engine;
+    let p = PathBuf::from(&path);
+    let meta = std::fs::metadata(&p).map_err(|e| format!("读取文件失败: {}", e))?;
+    if !meta.is_file() {
+        bail!("不是文件: {}", p.display());
+    }
+    const MAX_ATTACH_SIZE: u64 = 20 * 1024 * 1024;
+    if meta.len() > MAX_ATTACH_SIZE {
+        bail!("文件过大: {} (最大 20MB)", p.display());
+    }
+    let data = std::fs::read(&p).map_err(|e| format!("读取文件失败: {}", e))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    Ok(serde_json::json!({ "name": name, "base64": b64 }))
+}
+
+/// 判断路径是否为目录。粘贴"复制的文件夹"时前端据此把目录路径作为文本插入
+/// 输入框（而不是报"暂不支持该格式"），方便告知模型文件所在目录。
+#[tauri::command]
+pub fn is_directory(path: String) -> bool {
+    std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// 把前端传入的 base64 附件内容写入临时目录，返回磁盘绝对路径。
+/// 用于"超长文本附件走路径模式"：内容不再内联进 prompt（避免触发
+/// 70% 上下文守卫的死循环），而是落盘后让 Agent 用 view 工具分段读取。
+/// 浏览器选择/拖拽的 File 对象没有磁盘路径，需在此落盘；粘贴路径场景
+/// 前端直接持有真实路径，无需调用本命令。
+#[tauri::command]
+pub async fn save_attachment_file(
+    file_name: String,
+    base64_content: String,
+) -> Result<String, AppError> {
+    use base64::Engine;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&base64_content)
+        .map_err(|e| format!("附件 base64 解码失败: {}", e))?;
+    // 安全化文件名：仅保留字母数字、点、下划线、连字符，防路径穿越
+    let safe_name: String = file_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let safe_name = if safe_name.is_empty() {
+        "attachment".to_string()
+    } else {
+        safe_name
+    };
+    let dir = std::env::temp_dir().join("adm_attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建附件临时目录失败: {}", e))?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{}_{}", ts, safe_name));
+    std::fs::write(&path, &data).map_err(|e| format!("写入附件临时文件失败: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 读取系统剪贴板中的文件路径列表（Windows 资源管理器复制文件时为 CF_HDROP 格式）。
+/// 返回空数组表示剪贴板无文件（复制的是文本/图片等）。WebView2 不把文件路径
+/// 暴露给网页 DataTransfer，故在 Rust 侧直读剪贴板。
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EnumClipboardFormats, GetClipboardData, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    let mut paths: Vec<String> = Vec::new();
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Ok(paths);
+        }
+        // 枚举剪贴板格式，定位 CF_HDROP（文件列表）
+        let mut fmt: u32 = 0;
+        loop {
+            let next = EnumClipboardFormats(fmt);
+            if next == 0 {
+                break;
+            }
+            fmt = next;
+            if fmt == CF_HDROP.0 as u32 {
+                if let Ok(handle) = GetClipboardData(CF_HDROP.0 as u32) {
+                    if !handle.0.is_null() {
+                        let ptr = GlobalLock(HGLOBAL(handle.0));
+                        if !ptr.is_null() {
+                            let hdrop = HDROP(ptr);
+                            let count = DragQueryFileW(hdrop, u32::MAX, None);
+                            for i in 0..count {
+                                let len = DragQueryFileW(hdrop, i, None);
+                                if len == 0 {
+                                    continue;
+                                }
+                                let mut buf = vec![0u16; (len + 1) as usize];
+                                DragQueryFileW(hdrop, i, Some(&mut buf));
+                                let s = String::from_utf16_lossy(&buf[..len as usize]);
+                                if !s.is_empty() {
+                                    paths.push(s);
+                                }
+                            }
+                            let _ = GlobalUnlock(HGLOBAL(handle.0));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        let _ = CloseClipboard();
+    }
+    Ok(paths)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn read_clipboard_files() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
 }
 

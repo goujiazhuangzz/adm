@@ -1,24 +1,38 @@
 // 设置弹窗 / 云端模型添加 / admAgent 版本显示
 import { S, invoke } from "./state.js";
 import { api } from "./api.js";
-import { parseContextSize, escapeHtml, $input } from "./utils.js";
-import { showError, showConfirm, updateStatusBar } from "./ui.js";
+import { parseContextSize, escapeHtml, $input, normalizeReasoningEffort } from "./utils.js";
+import { showConfirm, reportError, updateStatusBar } from "./ui.js";
 import { switchToWorkspace, updateWorkspaceSelector } from "./workspace.js";
 import { updateModelDropdown, switchModel, refreshServerProviders } from "./model.js";
+import { isAutoContinueEnabled } from "./autocontinue.js";
+import { refreshProjectMemory } from "./memory.js";
 
 // ===== 设置弹窗 =====
 export function showSettings() {
   updateSettingsUI();
   document.getElementById("agent-settings-overlay").classList.add("show");
+  // 打开弹窗时刷新项目记忆（读取 workspace/project_memory.json，只读展示）
+  refreshProjectMemory();
 }
 
 export function hideSettings() {
   document.getElementById("agent-settings-overlay").classList.remove("show");
 }
 
+// 项目记忆折叠块交互：点击头部展开/收起（默认折叠）
+export function initProjectMemoryUI() {
+  var toggle = document.getElementById("agent-memory-toggle");
+  var collapse = document.getElementById("agent-memory-collapse");
+  if (!toggle || !collapse) return;
+  toggle.addEventListener("click", function() {
+    collapse.classList.toggle("open");
+  });
+}
+
 export function updateSettingsUI() {
   var workdir = $input("settings-workdir");
-  var yoloCheck = $input("settings-yolo");
+  var planCheck = $input("settings-plan");
   var reasoningSelect = $input("settings-reasoning-effort");
   var tempInput = $input("settings-temperature");
 
@@ -27,11 +41,17 @@ export function updateSettingsUI() {
     workdir.value = dir || "";
   }).catch(function() {});
 
-  // YOLO
-  yoloCheck.checked = !!S.settings.agent_yolo;
+  // Plan 模式
+  planCheck.checked = !!S.settings.agent_plan_mode;
 
-  // 推理强度
-  reasoningSelect.value = S.settings.agent_reasoning_effort || "";
+  // 自动续跑（localStorage 持久化，默认开启）
+  $input("settings-auto-continue").checked = isAutoContinueEnabled();
+
+  // 调试模式（持久化到 config.json 的 debug_logging，由后端开关控制）
+  $input("settings-debug-logging").checked = !!S.settings.debug_logging;
+
+  // 推理强度（旧版存过 ""/"auto"，归一化为 medium 回显）
+  reasoningSelect.value = normalizeReasoningEffort(S.settings.agent_reasoning_effort);
 
   // 温度
   tempInput.value = S.settings.agent_temperature || "";
@@ -50,10 +70,11 @@ export async function saveSettings() {
 
     // 保存 agent 设置到 config
     var s = await invoke("load_settings");
-    s.agent_yolo = S.settings.agent_yolo || false;
+    s.agent_plan_mode = S.settings.agent_plan_mode || false;
     s.agent_default_provider = S.settings.agent_default_provider || "local";
-    s.agent_reasoning_effort = S.settings.agent_reasoning_effort || "";
+    s.agent_reasoning_effort = normalizeReasoningEffort(S.settings.agent_reasoning_effort);
     s.agent_temperature = S.settings.agent_temperature || null;
+    s.debug_logging = S.settings.debug_logging || false;
     await invoke("save_settings", { settings: s });
 
     // 如果工作目录发生了变化，切换 workspace
@@ -65,7 +86,7 @@ export async function saveSettings() {
         // 复用它不产生任何引用保护，随后被服务端 teardown 就会满屏 404
         var newWs = await api("POST", "/v1/workspaces", {
           path: workdir,
-          yolo: S.settings.agent_yolo || false,
+          yolo: true, // 审批模式已移除：权限请求直通，Plan 模式靠服务端只读工具集约束
           client_id: S.clientId
         });
         // 切换到新 workspace
@@ -74,7 +95,7 @@ export async function saveSettings() {
         }
       } catch (e) {
         console.warn("[agent] 切换工作区失败:", e);
-        showError("切换工作目录失败: " + e);
+        reportError(e, { prefix: "切换工作目录失败: " });
       }
     } else {
       // 工作目录未变化，只更新 UI
@@ -83,25 +104,65 @@ export async function saveSettings() {
     updateWorkspaceSelector();
     updateStatusBar("ready", workdir, S.contextUsage.used);
   } catch (e) {
-    showError("保存设置失败: " + e);
+    reportError(e, { prefix: "保存设置失败: " });
   }
 }
 
-// ===== admAgent 版本检查 =====
-export async function checkAgentVersion() {
-  var el = document.getElementById("agent-current-version");
-  try {
-    var ver = await invoke("get_adm_agent_version");
-    if (el) el.textContent = ver || "未知";
-  } catch (_) {
-    if (el) el.textContent = "未知";
-  }
+// ===== 模型添加/修改弹窗 =====
+// 非 null 表示弹窗处于「修改」模式，值为正在编辑的 provider key
+var editingProviderKey = null;
+
+// 把 token 数格式化成上下文输入框接受的写法（与 parseContextSize 互逆）
+function formatCtxInput(n) {
+  if (!n) return "";
+  if (n % 1000000 === 0) return (n / 1000000) + "M";
+  if (n % 1000 === 0) return (n / 1000) + "K";
+  return String(n);
 }
 
-// ===== 模型添加弹窗 =====
+// 切换弹窗标题/提交按钮文案（add ↔ edit）
+function setAddModelDialogMode(isEdit) {
+  var title = document.getElementById("add-model-title");
+  var submit = document.getElementById("add-model-submit");
+  if (title) title.textContent = isEdit ? "修改云端模型" : "添加云端模型";
+  if (submit) submit.textContent = isEdit ? "保存" : "添加";
+}
+
+function clearAddModelForm() {
+  $input("add-model-name").value = "";
+  $input("add-model-baseurl").value = "";
+  $input("add-model-apikey").value = "";
+  $input("add-model-modelid").value = "";
+  $input("add-model-ctx").value = "";
+  $input("add-model-images").checked = false;
+  $input("add-model-reasoning").checked = false;
+  document.getElementById("add-model-msg").textContent = "";
+}
+
 export function showAddModelDialog() {
+  // 从修改模式切回添加模式时清空回填的旧值，避免误把旧模型参数当新模型提交
+  if (editingProviderKey !== null) {
+    editingProviderKey = null;
+    clearAddModelForm();
+  }
+  setAddModelDialogMode(false);
   document.getElementById("agent-add-model-overlay").classList.add("show");
   renderProviderList();
+}
+
+// 以「修改」模式打开弹窗，回填指定 provider 的全部参数
+function showEditModelDialog(p) {
+  editingProviderKey = p.key;
+  $input("add-model-modelid").value = p.model_id || "";
+  $input("add-model-name").value = p.name || "";
+  $input("add-model-baseurl").value = p.base_url || "";
+  $input("add-model-apikey").value = p.api_key || "";
+  $input("add-model-ctx").value = formatCtxInput(p.context_window);
+  $input("add-model-images").checked = !!p.supports_images;
+  $input("add-model-reasoning").checked = !!p.can_reason;
+  document.getElementById("add-model-msg").textContent = "";
+  setAddModelDialogMode(true);
+  document.getElementById("agent-add-model-overlay").classList.add("show");
 }
 
 export function hideAddModelDialog() {
@@ -114,7 +175,7 @@ function renderProviderList() {
   container.innerHTML = "";
 
   if (S.providers.length === 0) {
-    container.innerHTML = '<div style="color:#6e7681;font-size:12px;padding:8px 0;">暂无云端模型</div>';
+    container.innerHTML = '<div style="color:var(--c-text-4);font-size:12px;padding:8px 0;">暂无云端模型</div>';
     return;
   }
 
@@ -125,10 +186,14 @@ function renderProviderList() {
       '<div class="provider-card-header">' +
         '<span class="provider-name">' + escapeHtml(p.name) + '</span>' +
         '<div class="provider-actions">' +
+          '<button class="provider-action-btn edit" data-key="' + p.key + '">修改</button>' +
           '<button class="provider-action-btn delete" data-key="' + p.key + '">删除</button>' +
         '</div>' +
       '</div>' +
-      '<div class="provider-detail">' + escapeHtml(p.base_url) + ' · 上下文: ' + (p.context_window || '默认') + (p.supports_images ? ' · 支持图片' : '') + '</div>';
+      '<div class="provider-detail">' + escapeHtml(p.base_url) + ' · 上下文: ' + (p.context_window || '默认') + (p.supports_images ? ' · 支持图片' : '') + (p.can_reason ? ' · 思考模式' : '') + '</div>';
+    card.querySelector(".edit").addEventListener("click", function() {
+      showEditModelDialog(p);
+    });
     card.querySelector(".delete").addEventListener("click", function() {
       showConfirm("确定删除云端模型「" + p.name + "」？", async function() {
         try {
@@ -153,7 +218,7 @@ function renderProviderList() {
           renderProviderList();
           updateModelDropdown();
         } catch (e) {
-          showError("删除失败: " + e);
+          reportError(e, { prefix: "删除失败: " });
         }
       });
     });
@@ -175,15 +240,60 @@ export async function addModel() {
   var apiKey = $input("add-model-apikey").value.trim();
   var ctx = parseContextSize($input("add-model-ctx").value) || 256000;
   var supportsImages = $input("add-model-images").checked;
+  var canReason = $input("add-model-reasoning").checked;
 
   if (!modelId || !baseUrl || !apiKey) {
     addModelMsg("请填写模型ID、API地址和密钥", true);
     return;
   }
 
+  // 修改模式：按原 key 替换全部参数（key 不变，不产生孤儿条目）
+  if (editingProviderKey) {
+    var key = editingProviderKey;
+    try {
+      await invoke("update_cloud_provider", {
+        key: key,
+        input: { name: name, base_url: baseUrl, api_key: apiKey, context_window: ctx, model_id: modelId, supports_images: supportsImages, can_reason: canReason }
+      });
+      // 同步运行中的 server：与添加路径同理，只写标量 api_key 触发服务端落盘+从磁盘全量重载，
+      // 让刚写入 admAgent.json 的新参数（base_url / model id / 上下文等）立即生效
+      if (S.serverInfo && S.serverInfo.workspace_id) {
+        try {
+          await api("POST", "/v1/workspaces/" + S.serverInfo.workspace_id + "/config/set", {
+            scope: 0,
+            key: "providers." + key + ".api_key",
+            value: apiKey
+          });
+          delete S.pendingProviderKeys[key];
+        } catch (e) {
+          S.pendingProviderKeys[key] = true;
+          console.warn("[agent] 同步修改后的 provider 到服务端失败（重启后生效）:", e);
+        }
+      }
+      S.providers = await invoke("list_cloud_providers");
+      await refreshServerProviders();
+      renderProviderList();
+      updateModelDropdown();
+      // 改的正是当前激活的 provider：重新切换一次，让新 model id / 上下文窗口立即应用到 agent
+      var active = S.settings.agent_default_provider || "local";
+      if (active === key || active.indexOf(key + "/") === 0) {
+        await switchModel(key, name, ctx);
+      }
+      addModelMsg("修改成功", false);
+      setTimeout(function() {
+        hideAddModelDialog();
+        editingProviderKey = null;
+        clearAddModelForm();
+      }, 1000);
+    } catch (e) {
+      addModelMsg("修改失败: " + e, true);
+    }
+    return;
+  }
+
   try {
     var addResp = await invoke("add_cloud_provider", {
-      input: { name: name, base_url: baseUrl, api_key: apiKey, context_window: ctx, model_id: modelId || null, supports_images: supportsImages }
+      input: { name: name, base_url: baseUrl, api_key: apiKey, context_window: ctx, model_id: modelId, supports_images: supportsImages, can_reason: canReason }
     });
     // 关键：把新 provider 同步进运行中的 server（/config/set 会写盘并自动重载内存）。
     // 否则 server 只在启动时读 admAgent.json，选中新模型会报
@@ -230,13 +340,7 @@ export async function addModel() {
     }
     setTimeout(function() {
       hideAddModelDialog();
-      $input("add-model-name").value = "";
-      $input("add-model-baseurl").value = "";
-      $input("add-model-apikey").value = "";
-      $input("add-model-modelid").value = "";
-      $input("add-model-ctx").value = "";
-      $input("add-model-images").checked = false;
-      document.getElementById("add-model-msg").textContent = "";
+      clearAddModelForm();
     }, 1000);
   } catch (e) {
     addModelMsg("添加失败: " + e, true);

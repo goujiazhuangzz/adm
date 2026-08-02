@@ -1,3 +1,7 @@
+# AGENTS.md
+
+This file provides guidance to Qoder (qoder.com) when working with code in this repository.
+
 # ADM — Agent 指南
 
 ## 开发命令（始终使用 `pnpm`，不要用 `npm`/`yarn`）
@@ -6,6 +10,13 @@
 - `pnpm tauri clean` — 清理构建产物
 - `pnpm tauri:build:windows` / `:macos` / `:linux` — 跨平台构建
 - `pnpm typecheck` — 前端类型检查（tsc --noEmit，只检查不产出，改完前端必跑）
+
+### admAgent（Go，`admAgent/` 目录内执行）
+- `go build ./...` — 编译检查
+- `go test ./internal/... -count=1` — 全量单测（Windows 上 `internal/shell` 的 shebang 测试依赖 /bin/bash、`internal/server` 偶发 TempDir 文件锁抖动，属环境问题可忽略）
+- `go test ./internal/agent/ -run 'TestName' -count=1` — 单个测试
+- `build.ps1` — Windows 构建脚本；改完 Go 代码必须重新编译打包 sidecar 才在 ADM 里生效
+- 运行时日志：`%LOCALAPPDATA%\admAgent\cache\server-tcp___127.0.0.1_<port>\admAgent.log`（每次启动一个目录，按 LastWriteTime 找最新；注意 Windows 目录列表可能显示 0 字节，直接读内容为准）。排查“对话突然中断”类问题 grep `Loop step response|ending turn|nudg`：`text_bytes=0` 但 `output_tokens` 很大 = 模型输出全部漏进 reasoning（典型为 localModel 在 40k+ 上下文下退化）
 
 ## 架构
 - **Tauri 2.11.2** + Rust 后端 + **原生 HTML/CSS/JS**（无框架、无打包工具）。
@@ -27,6 +38,14 @@
 - **Agent 页面**（`src/views/agent.js`）为独立 ESM 视图，由路由 `#/agent` 加载，不再使用 iframe / PTY 终端。
 - 子页面 → 父窗口导航：使用 `location.hash = "#/list"` 等 hash 路由。
 
+## 前端错误处理（Agent 视图，`src/views/agent/`）
+- **统一提取**：所有服务端错误（API invoke 抛错、SSE 事件内嵌 error）先用 `error.js` 的 `getErrorMessage()` 提取可读文本（兼容 string / Error / `{"error":{"message","type"}}` / 其它对象），再用 `classifyError()` 分类（quota/timeout/network/not_found/cancel/unknown）。
+- **统一展示入口**：错误统一走 `ui.js` 的 `reportError(err, { prefix, hint })`，内部自动提取+分类：quota（401/余额/授权）类直接显示"余额不足，任务中断"，其余显示原始错误；三档 UI 为 `showNotice(msg, level)`（error 红 / warn 黄 / info 灰），消息区节点 60s 自动消失，`showError/showWarning/showInfo` 是薄封装。
+- **禁止** `showError("前缀: " + e)` 直接拼接错误对象（对象会显示 `[object Object]`）；应把**原始错误**传给 `reportError(e, { prefix })`。本地状态提示（无服务端错误对象，如"文件过大"、轮数上限）才直接用 `showError/showWarning` 字符串。
+- **SSE 错误路径**：`run_complete` / `agent_event` 内嵌 error 均走 `reportError`，不要在 sse.js 里自行实现 formatRunError/isQuotaError（已在统一模块）。
+- **假完成/静默停止检测**（`sse.js` `detectFakeCompletion`）：本轮有 edit/write/multiedit/bash/lsp 等副作用工具调用、但工具调用总数 ≤4、且 prompt 含操作动词（部署/修复/重构…）时，`showWarning` 提示"任务可能未完整执行"（服务端重试耗尽后 run_complete 无 error 静默结束的兜底）。
+- **自动续跑进度判定**（`autocontinue.js` `maybeAutoContinue(data, runStats)`）：本轮有 edit/write/bash 等实质副作用工具**成功落地**（`runStats.sideEffectSuccess > 0`）视为有进展、不计无进展，避免"模型在干活但没标 todos"被误熔断。
+
 ## Rust 后端（`src-tauri/src/`）
 | 模块 | 关键命令 |
 |--------|-------------|
@@ -34,17 +53,21 @@
 | `model_list.rs` | `fetch_model_list`, `scan_local_models`, `download_model`, `start_model`, `stop_model`, `get_model_status` |
 | `settings.rs` | `save_settings`（原子写入：`.tmp` + `rename`）, `load_settings`, `get_app_version`, `get_llamacpp_version` |
 | `model_image.rs` | `check_sd_exists`, `download_and_extract_sd`, `start_sd_generation`, `stop_sd` |
-| `agent.rs` | `start_agent_server`, `stop_agent_server`, `get_agent_server_status`, `agent_http_request`, `agent_subscribe_events`, `agent_unsubscribe_events`, `check_adm_agent`, `download_adm_agent`, `add/list/update/delete_cloud_provider`, `prepare_adm_agent_config` |
+| `agent.rs` | `start_agent_server`, `stop_agent_server`, `get_agent_server_status`, `agent_http_request`, `agent_subscribe_events`, `agent_unsubscribe_events`, `check_adm_agent`, `get_adm_agent_version`, `add/list/update/delete_cloud_provider`, `prepare_adm_agent_config` |
 
 ## 关键注意事项
 - **MTP 自动检测**：如果模型文件名包含 "mtp"（不区分大小写），`start_model` 会自动追加 `--spec-draft-n-max 2 --spec-type draft-mtp`。设置 `params.spec_type = "none"` 可禁用。
 - **HuggingFace 镜像**：`download_model` 会自动将所有 `huggingface.co` 链接替换为 `hf-mirror.com`。
 - **断点续传**：使用 `.part` 后缀 + HTTP `Range` 头；`scan_part_files` 列出未完成的下载。
 - **硬件优先级**：`hwinfo` 插件数据覆盖 `sysinfo`。
-- **更新流程**：启动后延迟 3 秒 → 应用更新 → VC++ 运行库（仅 Windows）→ llamacpp 下载。
+- **更新流程**：启动后延迟 3 秒 → 应用更新 → VC++ 运行库（仅 Windows）→ llamacpp 下载。admAgent 不再运行时下载/升级，随安装包内置（见下）。
+- **admAgent 内置分发**：编译好的 admAgent 压缩包放在 `buildAgent/`（`admAgent_{ver}_Windows_x86_64.zip` / `admAgent_{ver}_Darwin_arm64.tar.gz`）。`beforeDevCommand`/`beforeBuildCommand` 运行 `scripts/prepare-agent-binary.mjs`：按构建目标自动选包、解压到临时目录、把二进制放到 `src-tauri/binaries/admAgent-<target-triple>`（git 忽略），再由 `bundle.externalBin`（sidecar）打进安装包。运行时路径：Windows 为 ADM.exe 同目录的 `admAgent.exe`，macOS 为 `ADM.app/Contents/MacOS/admAgent`；macOS 启动时会清理旧版下载模式遗留在 app_data_dir 的 admAgent。
 - **窗口关闭**：`on_window_event` 通过 `taskkill /F`（Windows）或 `kill -9` 杀死 llama-server 和 admAgent server。
 - **Agent server 模式**：admAgent 以子进程 `serve --host tcp://127.0.0.1:0` 启动，后端从 stdout 解析端口，通过 `agent_http_request` 代理 HTTP API，SSE 事件通过 Tauri event `agent-sse-event` 转发给前端。
-- **Agent 设置**：`agent_yolo` / `agent_default_provider` / `agent_reasoning_effort` / `agent_temperature` 存储在 `config.json`（Settings 结构体），前端通过 `load_settings` / `save_settings` 读写。
+- **Agent loop 抖动恢复体系**（`admAgent/internal/agent/agent_loop_llm.go`）：空 stop 重试（上限 3）、叙述性 stop 重试、推理超限（软阈值按 reasoning_effort 分档，丢弃+nudge+重试 1 次）、未完成 todos nudge（**进度感知**：连续 3 次无进展才放弃，有进展（todo 完成或 edit/write/bash 等实质副作用工具成功）即清零计数，硬熔断总上限 10 次）、假完成检测。重试耗尽后本轮**无 error 静默结束**（run_complete 不带错误），UI 侧表现为“突然停了”。
+- **Plan 模式 = 纯规划**：工具白名单（`config.ResolvePlanModeTools`）只含只读工具，**不含 edit/write/download/todos/MCP**；bash 在工具内部按只读命令白名单校验；计划以正文文本输出，todo 追踪只属于执行模式；todo-nudge 在 todos 工具不在目录时自动跳过。
+- **前端自动续跑**（`src/views/agent/autocontinue.js`）：本轮正常结束但 todos 未完成时自动发“继续”开新轮（每轮重置服务端 nudge 预算）；上限 10 轮、连续 2 轮无进展自动停；仅续跑本客户端发起的任务；Plan 模式、出错、取消、切走会话均不触发；开关存 localStorage（`agent_auto_continue`，默认开）。
+- **Agent 设置**：`agent_plan_mode` / `agent_default_provider` / `agent_reasoning_effort` / `agent_temperature` / `debug_logging` 存储在 `config.json`（Settings 结构体），前端通过 `load_settings` / `save_settings` 读写。
 - **Windows**：`main.rs` 中的 `#![windows_subsystem = "windows"]` + `build.rs` 中的 `/SUBSYSTEM:WINDOWS` 隐藏控制台。
 
 ## 构建与发布
